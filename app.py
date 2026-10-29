@@ -6,8 +6,38 @@ around them has been rebuilt in an Apple-style product shell.
 """
 
 from __future__ import annotations
-from rag.assistant import answer as rag_answer
+from collections.abc import Mapping
+import hashlib
+import secrets
 from typing import Any
+
+from admin_security import (
+    admin_session_summary,
+    check_admin_login,
+    get_admin_credentials,
+    is_admin_session_valid,
+    logout_admin_session,
+    read_admin_audit_logs,
+)
+from rag.assistant import answer as rag_answer
+from scientific_report import build_scientific_report
+
+from digital_twin import (
+    render_digital_twin,
+    render_overview_hydro_intelligence_dashboard,
+    render_modflow_section,
+    render_telemetry_section,
+    render_water_budget_section,
+)
+from security_engine import (
+    DIGITAL_TWIN_AUDIT,
+    calculate_forecast_uncertainty,
+    sanitize_rag_prompt,
+    sanitize_rag_response,
+    tag_observation_type,
+    validate_environmental_record,
+    validate_forecast_workload,
+)
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -17,14 +47,17 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.stats import pearsonr
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
 
 from matplotlib.ticker import MultipleLocator
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+from session_store import workspace_store
 
 from pipeline import (
     SEASON_ORDER,
     RunConfig,
     acf_pacf_table,
+    build_2x2_forecast_figure,
     build_aggregated_series,
     build_excel_export,
     load_seasonal_workbook,
@@ -70,23 +103,37 @@ def apply_plotly_light_theme(fig):
             bordercolor="rgba(0,0,0,0.08)",
             borderwidth=1,
         ),
+        coloraxis=dict(
+            colorbar=dict(
+                tickfont=dict(color="#334155", size=11),
+                title=dict(font=dict(color="#1D1D1F", size=12)),
+            ),
+        ),
         margin=dict(l=60, r=30, t=60, b=60),
     )
 
     fig.update_xaxes(
         title_font=dict(color="#1D1D1F", size=13),
-        tickfont=dict(color="#6E6E73", size=11),
+        tickfont=dict(color="#475569", size=11),
         linecolor="rgba(0,0,0,0.12)",
         gridcolor="rgba(0,0,0,0.07)",
         zerolinecolor="rgba(0,0,0,0.12)",
     )
     fig.update_yaxes(
         title_font=dict(color="#1D1D1F", size=13),
-        tickfont=dict(color="#6E6E73", size=11),
+        tickfont=dict(color="#475569", size=11),
         linecolor="rgba(0,0,0,0.12)",
         gridcolor="rgba(0,0,0,0.07)",
         zerolinecolor="rgba(0,0,0,0.12)",
     )
+
+    for trace in fig.data:
+        if "colorbar" in getattr(trace, "_valid_props", set()):
+            try:
+                trace.colorbar.tickfont.color = "#334155"
+                trace.colorbar.title.font.color = "#1D1D1F"
+            except (AttributeError, TypeError, ValueError):
+                pass
 
     # 3D scenes (surface / scatter_3d) use a different layout key.
     try:
@@ -95,21 +142,21 @@ def apply_plotly_light_theme(fig):
                 scene=dict(
                     xaxis=dict(
                         title_font=dict(color="#1D1D1F"),
-                        tickfont=dict(color="#6E6E73"),
+                        tickfont=dict(color="#475569"),
                         gridcolor="rgba(0,0,0,0.10)",
                         backgroundcolor="rgba(0,0,0,0)",
                         linecolor="rgba(0,0,0,0.12)",
                     ),
                     yaxis=dict(
                         title_font=dict(color="#1D1D1F"),
-                        tickfont=dict(color="#6E6E73"),
+                        tickfont=dict(color="#475569"),
                         gridcolor="rgba(0,0,0,0.10)",
                         backgroundcolor="rgba(0,0,0,0)",
                         linecolor="rgba(0,0,0,0.12)",
                     ),
                     zaxis=dict(
                         title_font=dict(color="#1D1D1F"),
-                        tickfont=dict(color="#6E6E73"),
+                        tickfont=dict(color="#475569"),
                         gridcolor="rgba(0,0,0,0.10)",
                         backgroundcolor="rgba(0,0,0,0)",
                         linecolor="rgba(0,0,0,0.12)",
@@ -127,7 +174,7 @@ def apply_plotly_light_theme(fig):
             if getattr(fig.layout, xa, None) is not None:
                 fig.update_layout(**{xa: dict(
                     title_font=dict(color="#1D1D1F", size=13),
-                    tickfont=dict(color="#6E6E73", size=11),
+                    tickfont=dict(color="#475569", size=11),
                     linecolor="rgba(0,0,0,0.12)",
                     gridcolor="rgba(0,0,0,0.07)",
                     zerolinecolor="rgba(0,0,0,0.12)",
@@ -135,7 +182,7 @@ def apply_plotly_light_theme(fig):
             if getattr(fig.layout, ya, None) is not None:
                 fig.update_layout(**{ya: dict(
                     title_font=dict(color="#1D1D1F", size=13),
-                    tickfont=dict(color="#6E6E73", size=11),
+                    tickfont=dict(color="#475569", size=11),
                     linecolor="rgba(0,0,0,0.12)",
                     gridcolor="rgba(0,0,0,0.07)",
                     zerolinecolor="rgba(0,0,0,0.12)",
@@ -192,7 +239,7 @@ DEEP_MODEL_MARKERS = {
 
 st.set_page_config(
     page_title="NAYA-PANI — Groundwater Intelligence",
-    page_icon="💧",
+    page_icon="static/nayapani-icon-192.png",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -211,6 +258,7 @@ st.markdown(
         [data-testid="stAppViewContainer"],
         [data-testid="stHeader"],
         [data-testid="stToolbar"] {
+            color-scheme: light !important;
             --background-color: #F5F5F7 !important;
             --secondary-background-color: #FFFFFF !important;
             --text-color: #1D1D1F !important;
@@ -245,6 +293,48 @@ header {
 /* Hide only the decorative element */
 [data-testid="stDecoration"] {
     display: none !important;
+}
+header[data-testid="stHeader"],
+.stAppHeader,
+[data-testid="stAppHeader"],
+header,
+[data-testid="stHeader"],
+[data-testid="stToolbar"],
+[data-testid="stAppToolbar"] {
+    background: #F5F5F7 !important;
+    color: #1D1D1F !important;
+}
+.stAppHeader *,
+[data-testid="stAppHeader"] *,
+[data-testid="stHeader"] * {
+    color: #334155 !important;
+    fill: #334155 !important;
+}
+[data-testid="stHeader"] button[data-testid^="stBaseButton"] *,
+[data-testid="stAppHeader"] button[data-testid^="stBaseButton"] * {
+    color: #334155 !important;
+    fill: #334155 !important;
+    -webkit-text-fill-color: #334155 !important;
+}
+[data-testid="stPopover"],
+[data-testid="stPopoverBody"],
+[data-testid="stPopoverBody"] > div,
+[data-testid="stPopoverBody"] [data-testid="stVerticalBlockBorderWrapper"],
+[data-testid="stPopoverBody"] [data-testid="stVerticalBlock"] {
+    background-color: #FFFFFF !important;
+    color: #1D1D1F !important;
+}
+[data-testid="stPopoverBody"] [data-testid="stMarkdownContainer"] *,
+[data-testid="stPopoverBody"] [data-testid="stChatMessage"] * {
+    color: #1D1D1F !important;
+}
+[data-testid="stFileChip"] {
+    background: #F5F5F7 !important;
+    border: 1px solid rgba(0,0,0,0.08) !important;
+}
+[data-testid="stFileChip"] * {
+    color: #1D1D1F !important;
+    -webkit-text-fill-color: #1D1D1F !important;
 }
 
         /* ============================================================
@@ -284,7 +374,8 @@ header {
         [data-testid="stCaptionContainer"],
         [data-testid="stCaptionContainer"] *,
         small {
-            color: #6E6E73 !important;
+            color: #475569 !important;
+            opacity: 1 !important;
         }
 
         /* ============================================================
@@ -302,15 +393,61 @@ header {
             box-shadow: 0 1px 2px rgba(0,0,0,.03), 0 8px 30px rgba(0,0,0,.045);
         }
         .top-nav .brand {
-            display: flex; align-items: center; gap: 12px;
-            font-size: 1.15rem; font-weight: 700;
+            display: flex; align-items: center; gap: 14px;
+            font-size: 2rem; font-weight: 700;
             letter-spacing: -0.02em; color: #1D1D1F;
         }
-        .top-nav .brand-icon { font-size: 1.55rem; }
+        .top-nav .brand-name {
+            display: inline-block;
+            font-size: 2rem;
+            font-weight: 800;
+            line-height: 1;
+            letter-spacing: .025em;
+            color: #0071E3;
+            background: linear-gradient(110deg, #0058b0 10%, #0071E3 45%, #32b6c8 65%, #0058b0 90%);
+            background-size: 220% auto;
+            background-clip: text;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            animation: brand-shimmer 5s ease-in-out infinite,
+                       brand-enter .7s cubic-bezier(.2,.8,.2,1) both;
+        }
+        @keyframes brand-shimmer {
+            0%, 100% { background-position: 0% center; }
+            50% { background-position: 100% center; }
+        }
+        @keyframes brand-enter {
+            from { opacity: 0; transform: translateY(7px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .top-nav .brand-icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 46px;
+            height: 46px;
+            flex: 0 0 46px;
+            border-radius: 15px;
+            background: linear-gradient(145deg, rgba(0,113,227,.14), rgba(50,182,200,.12));
+            font-size: 1.9rem;
+            line-height: 1;
+            box-shadow: inset 0 0 0 1px rgba(0,113,227,.08);
+        }
         .top-nav .brand-subtitle {
             color: #6E6E73;
-            font-size: .82rem;
-            margin-top: 2px;
+            font-size: .9rem;
+            margin-top: 5px;
+        }
+        @media (max-width: 600px) {
+            .top-nav .brand { gap: 10px; }
+            .top-nav .brand-name { font-size: 1.65rem; }
+            .top-nav .brand-icon {
+                width: 40px;
+                height: 40px;
+                flex-basis: 40px;
+                font-size: 1.65rem;
+            }
+            .top-nav .brand-subtitle { font-size: .78rem; }
         }
         .top-nav .status-pill {
             background: rgba(52,199,89,.12);
@@ -321,6 +458,12 @@ header {
             border-radius: 999px;
             border: 1px solid rgba(52,199,89,.22);
             white-space: nowrap;
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .top-nav .brand-name {
+                animation: none;
+                background-position: 50% center;
+            }
         }
 
         /* ============================================================
@@ -765,30 +908,53 @@ header {
             box-shadow: 0 1px 2px rgba(0,0,0,.03), 0 8px 30px rgba(0,0,0,.04);
             margin-bottom: 12px;
         }
-        [data-testid="stRadio"] > div[role="radiogroup"] label {
+        [data-testid="stRadio"] > div[role="radiogroup"][aria-label="Navigation"] label {
             background: transparent !important;
             border-radius: 999px !important;
             padding: 8px 16px !important;
-            transition: all .18s ease;
+            transition: background-color .22s ease, box-shadow .22s ease,
+                        color .22s ease, transform .22s ease;
             cursor: pointer;
         }
-        [data-testid="stRadio"] > div[role="radiogroup"] label:hover {
+        [data-testid="stRadio"] > div[role="radiogroup"][aria-label="Navigation"] label:hover {
             background: #F5F5F7 !important;
+            transform: translateY(-1px);
         }
-        [data-testid="stRadio"] > div[role="radiogroup"] label * {
+        [data-testid="stRadio"] > div[role="radiogroup"][aria-label="Navigation"] label * {
             color: #1D1D1F !important;
             font-weight: 600 !important;
             font-size: .92rem !important;
         }
-        [data-testid="stRadio"] > div[role="radiogroup"] label > div:first-child {
+        [data-testid="stRadio"] > div[role="radiogroup"][aria-label="Navigation"] label > div > div > div:first-child {
             display: none !important;
         }
-        [data-testid="stRadio"] > div[role="radiogroup"] label:has(input:checked) {
+        [data-testid="stRadio"] > div[role="radiogroup"][aria-label="Navigation"] label:has(input:checked) {
             background: #0071E3 !important;
             box-shadow: 0 3px 10px rgba(0,113,227,.30);
         }
-        [data-testid="stRadio"] > div[role="radiogroup"] label:has(input:checked) * {
+        [data-testid="stRadio"] > div[role="radiogroup"][aria-label="Navigation"] label:has(input:checked) * {
             color: #FFFFFF !important;
+        }
+
+        /* Smooth page-content entrance when the horizontal page navigation changes. */
+        .st-key-page_transition {
+            animation: pageContentEnter .38s cubic-bezier(.2, .75, .25, 1) both;
+            transform-origin: top center;
+        }
+        @keyframes pageContentEnter {
+            from { opacity: 0; transform: translateY(12px) scale(.995); }
+            to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .st-key-page_transition {
+                animation: none !important;
+            }
+            [data-testid="stRadio"] > div[role="radiogroup"] label {
+                transition: none !important;
+            }
+            [data-testid="stRadio"] > div[role="radiogroup"] label:hover {
+                transform: none !important;
+            }
         }
 
         /* ============================================================
@@ -810,8 +976,17 @@ header {
         }
         .stButton > button *,
         .stDownloadButton > button *,
-        .stFormSubmitButton > button * {
+        .stFormSubmitButton > button *,
+        button[kind="primary"] *,
+        button[kind="secondary"] *,
+        [data-testid^="stBaseButton"] * {
             color: #FFFFFF !important;
+            -webkit-text-fill-color: #FFFFFF !important;
+        }
+        button[data-testid^="stBaseButton"] [data-testid="stMarkdownContainer"] *,
+        [data-testid^="stBaseButton"] [data-testid="stMarkdownContainer"] * {
+            color: #FFFFFF !important;
+            -webkit-text-fill-color: #FFFFFF !important;
         }
         .stButton > button:hover,
         .stDownloadButton > button:hover,
@@ -999,6 +1174,13 @@ header {
             box-shadow: none !important;
             padding: 0 !important;
         }
+        [data-testid="stPlotlyChart"] .xtick text,
+        [data-testid="stPlotlyChart"] .ytick text,
+        [data-testid="stPlotlyChart"] .legend text,
+        [data-testid="stPlotlyChart"] .colorbar text,
+        [data-testid="stPlotlyChart"] .gtitle {
+            fill: #334155 !important;
+        }
 
         /* Plotly modebar — light, subtle, visible */
         [data-testid="stPlotlyChart"] .modebar {
@@ -1132,10 +1314,17 @@ header {
             font-size: .93rem;
         }
         .upload-hint * { color: #1D1D1F !important; }
+        iframe[height="0"] { display: none !important; height: 0 !important; border: none !important; }
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+import importlib
+import pwa_server
+importlib.reload(pwa_server)
+from pwa_server import get_brand_logo_base64, inject_pwa_head_and_sidebar_installer, render_sidebar_pwa_button
+inject_pwa_head_and_sidebar_installer()
 
 
 # --------------------------------------------------------------------------- #
@@ -1448,6 +1637,22 @@ def render_data_quality(payload: dict[str, Any]) -> None:
             "enough data for the train/validation/test split. Raw measurements and the "
             "target itself were never altered — only engineered lag/rolling/trend columns."
         )
+    with st.expander("🛡️ Environmental Dataset Security & Out-of-Distribution Audit"):
+        audit_list = []
+        sample_df = data.head(100)
+        for idx, row_series in sample_df.iterrows():
+            for n in validate_environmental_record(row_series.to_dict()):
+                audit_list.append({
+                    "Row": idx,
+                    "Category": n.category,
+                    "Severity": n.severity,
+                    "Finding": n.message
+                })
+        if audit_list:
+            st.dataframe(pd.DataFrame(audit_list), use_container_width=True, hide_index=True)
+        else:
+            st.success("All sampled environmental indicators and coordinates passed physical & geographic boundary validation.")
+
     with st.expander("Input format expected by this dashboard"):
         st.markdown(
             "Use an `.xlsx` workbook with sheets named **Monsoon**, **Pre_Monsoon**, "
@@ -1567,7 +1772,7 @@ def render_selection(results: dict[str, dict[str, Any]]) -> None:
     figure = px.bar(
         chart_data, x="Mutual information", y="Feature", color="Selected",
         orientation="h",
-        color_discrete_map={True: "#0071E3", False: "#c7c7cc"},
+        color_discrete_map={True: "#0071E3", False: "#94A3B8"},
         labels={"Selected": "Included in model"},
         title=f"Training-period feature relevance — {result['season']}",
     )
@@ -2397,6 +2602,23 @@ def render_forecast_and_export(payload: dict[str, Any]) -> None:
     st.plotly_chart(figure, use_container_width=True)
     st.dataframe(forecast, use_container_width=True, hide_index=True)
 
+    with st.expander("🛡️ Scientific Reliability & 95% Prediction Uncertainty Bounds"):
+        st.caption(
+            "Decision-Support Safety Notice: Model projections are statistical estimates holding "
+            "exogenous weather drivers constant at the last observed year. They must be reviewed alongside "
+            "in-situ piezometer observations before consequential water-management actions."
+        )
+        try:
+            top_rmse = float(result["metrics"].iloc[0]["Bias-corrected test RMSE"])
+            val_col = "Scenario forecast DTWL (mbgl)"
+            if val_col in forecast.columns:
+                ci_df = calculate_forecast_uncertainty(forecast[val_col].to_numpy(), top_rmse)
+                if "Year" in forecast.columns:
+                    ci_df.insert(0, "Year", forecast["Year"].to_numpy())
+                st.dataframe(ci_df, use_container_width=True, hide_index=True)
+        except Exception:
+            pass
+
     st.markdown("#### Notebook layout — next 3 years, all four seasons (2×2)")
     st.markdown(
         '<div class="notebook-caption">Each panel is one season. The historical '
@@ -2753,6 +2975,41 @@ def render_deep_models(results: dict[str, dict[str, Any]]) -> None:
             ax.legend(loc="upper right", fontsize=8, frameon=True)
         _matplotlib_to_streamlit(fig)
 
+    deep_fc = result.get("deep_forecast")
+    if isinstance(deep_fc, pd.DataFrame) and not deep_fc.empty:
+        st.markdown(f"#### 🔮 Scenario forecasting — Best deep model ({result.get('deep_best_model')})")
+        st.caption("Multi-year recursive Depth to Water Level (DTWL) forecast generated by the top-performing deep-learning model.")
+        col_fc1, col_fc2 = st.columns([1, 2])
+        with col_fc1:
+            st.dataframe(deep_fc, use_container_width=True, hide_index=True)
+        with col_fc2:
+            fig_deep_fc = px.line(
+                deep_fc, x="Year", y="Scenario forecast DTWL (mbgl)",
+                markers=True,
+                title=f"Deep Model Forecast ({result.get('deep_best_model')}) — {result['season']}",
+                labels={"Scenario forecast DTWL (mbgl)": "Forecasted DTWL (mbgl)"}
+            )
+            fig_deep_fc.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig_deep_fc, use_container_width=True)
+
+    st.markdown("#### 🖼️ Notebook layout — next 3-5 years, all four seasons (2x2) — Deep Learning Family")
+    st.markdown(
+        '<div class="notebook-caption">Each panel is one season. The historical '
+        'annual mean (black) is extended from the last observed year using all '
+        'fitted deep-learning and physics-informed models (PINN, ESN, SARIMA, LSTM). '
+        'Blue arrows mark each forecast year, and the inset zooms on the last decade plus the forecast.</div>',
+        unsafe_allow_html=True,
+    )
+    n_steps_deep = 5
+    if results:
+        for s_res in results.values():
+            if isinstance(s_res, dict) and "deep_forecast" in s_res and isinstance(s_res["deep_forecast"], pd.DataFrame):
+                n_steps_deep = len(s_res["deep_forecast"])
+                break
+        deep_2x2_fig = build_2x2_forecast_figure(results, n_steps=n_steps_deep, is_deep=True)
+        if deep_2x2_fig is not None:
+            _matplotlib_to_streamlit(deep_2x2_fig)
+
 
 # --------------------------------------------------------------------------- #
 # Chatbot — first-class page (middle column, light theme)
@@ -2764,8 +3021,8 @@ def render_chat(payload: dict[str, Any] | None) -> None:
         <div class="eyebrow">AI ASSISTANT</div>
         <h1>Ask the dashboard.</h1>
         <p>
-            Plain-English questions about your results, metrics, models and
-            forecasts — grounded in a curated knowledge base plus a live
+            Plain-English questions about your results, models, forecasts and
+            Digital Twin — grounded in a curated knowledge base plus a live
             summary of the current run.
         </p>
     </div>
@@ -2776,7 +3033,7 @@ def render_chat(payload: dict[str, Any] | None) -> None:
         what=(
             "A chat box that answers questions about the current run: which season "
             "performed best, what a metric means, how the Taylor diagram is read, "
-            "what the wavelet peaks indicate, and so on."
+            "what the wavelet peaks indicate, or what the Digital Twin is showing."
         ),
         why=(
             "New users often do not know which metric to look at first. The assistant "
@@ -2794,35 +3051,261 @@ def render_chat(payload: dict[str, Any] | None) -> None:
         for turn in st.session_state["rag_history"]:
             with st.chat_message(turn["role"]):
                 st.markdown(turn["content"])
+                meta_parts = []
+                if turn.get("provenance"):
+                    meta_parts.append("Provenance: " + " · ".join(turn["provenance"]))
                 if turn.get("sources"):
-                    st.caption("Sources: " + ", ".join(turn["sources"]))
+                    meta_parts.append("Sources: " + ", ".join(turn["sources"]))
+                if meta_parts:
+                    st.caption(" | ".join(meta_parts))
 
-        prompt = st.chat_input("Ask about seasons, metrics, models, Taylor, wavelet…")
+        prompt = st.chat_input("Ask about seasons, metrics, models, Taylor, wavelets, or the Digital Twin…")
         if prompt:
+            clean_prompt, sec_notices = sanitize_rag_prompt(prompt)
+            for notice in sec_notices:
+                if notice.severity == "CRITICAL":
+                    st.warning(f"🛡️ Security Guard ({notice.category}): {notice.message}")
+            prior_history = list(st.session_state["rag_history"])
             st.session_state["rag_history"].append(
-                {"role": "user", "content": prompt, "sources": []}
+                {"role": "user", "content": clean_prompt, "sources": [], "provenance": []}
             )
             with st.chat_message("user"):
-                st.markdown(prompt)
+                st.markdown(clean_prompt)
 
             with st.chat_message("assistant"):
                 with st.spinner("Thinking…"):
-                    result = rag_answer(prompt, payload)
+                    result = rag_answer(
+                        clean_prompt,
+                        payload,
+                        history=prior_history,
+                        twin_state=st.session_state.get("digital_twin_state"),
+                    )
+                    result["answer"] = sanitize_rag_response(result["answer"])
                 st.markdown(result["answer"])
+                meta_parts = []
+                if result.get("provenance"):
+                    meta_parts.append("Provenance: " + " · ".join(result["provenance"]))
                 if result.get("sources"):
-                    st.caption("Sources: " + ", ".join(result["sources"]))
+                    meta_parts.append("Sources: " + ", ".join(result["sources"]))
+                if meta_parts:
+                    st.caption(" | ".join(meta_parts))
 
             st.session_state["rag_history"].append({
                 "role": "assistant",
                 "content": result["answer"],
                 "sources": result.get("sources", []),
+                "provenance": result.get("provenance", []),
             })
+
+
+def render_floating_assistant(
+    payload: dict[str, Any] | None,
+    current_page: str,
+) -> None:
+    """Render a high-contrast assistant popover docked to the viewport corner."""
+    st.markdown(
+        """
+        <style>
+          .st-key-floating_assistant {
+            position: fixed !important;
+            right: 22px !important;
+            bottom: 20px !important;
+            z-index: 100000 !important;
+            width: 106px !important;
+            height: 54px !important;
+          }
+          .st-key-floating_assistant [data-testid="stPopoverButton"] {
+            width: 146px !important;
+            min-width: 146px !important;
+            height: 54px !important;
+            min-height: 54px !important;
+            padding: 0 16px !important;
+            border: 1px solid rgba(15, 23, 42, .10) !important;
+            border-radius: 28px !important;
+            background: linear-gradient(145deg, #f0fdf4 0%, #e0f2fe 100%) !important;
+            color: #0f172a !important;
+            box-shadow: 0 5px 22px rgba(15, 23, 42, .22),
+                        inset 0 0 0 1px rgba(15, 118, 110, .12) !important;
+            font-size: 16px !important;
+            font-weight: 800 !important;
+            letter-spacing: 0.1px !important;
+            font-family: "Segoe UI", "Arial", sans-serif !important;
+            transition: transform .18s ease, box-shadow .18s ease !important;
+          }
+          .st-key-floating_assistant [data-testid="stPopoverButton"]:hover {
+            transform: translateY(-2px) scale(1.03) !important;
+            box-shadow: 0 8px 26px rgba(15, 23, 42, .28),
+                        inset 0 0 0 1px rgba(15, 118, 110, .18) !important;
+          }
+          .st-key-floating_assistant [data-testid="stPopoverButton"] *,
+          .st-key-floating_assistant [data-testid="stPopoverButton"] span {
+            color: #0f172a !important;
+            fill: #0f172a !important;
+            -webkit-text-fill-color: #0f172a !important;
+          }
+          [data-testid="stPopoverBody"] {
+            width: min(410px, calc(100vw - 32px)) !important;
+            max-height: min(70vh, 620px) !important;
+            overflow-y: auto !important;
+            background: #ffffff !important;
+            color: #111827 !important;
+            border: 1px solid #cbd5e1 !important;
+            border-radius: 18px !important;
+            box-shadow: 0 16px 48px rgba(15, 23, 42, .25) !important;
+          }
+          [data-testid="stPopoverBody"] *,
+          [data-testid="stPopoverBody"] [data-testid="stMarkdownContainer"] p,
+          [data-testid="stPopoverBody"] [data-testid="stMarkdownContainer"] li,
+          [data-testid="stPopoverBody"] label {
+            color: #111827 !important;
+            font-size: 15px !important;
+            line-height: 1.55 !important;
+          }
+          [data-testid="stPopoverBody"] [data-testid="stChatMessage"] {
+            background: #f1f5f9 !important;
+            border: 1px solid #cbd5e1 !important;
+          }
+          [data-testid="stPopoverBody"] [data-testid="stCaptionContainer"],
+          [data-testid="stPopoverBody"] [data-testid="stCaptionContainer"] * {
+            color: #475569 !important;
+          }
+          [data-testid="stPopoverBody"] textarea,
+          [data-testid="stPopoverBody"] input {
+            background: #ffffff !important;
+            color: #111827 !important;
+            font-size: 16px !important;
+            border: 1px solid #64748b !important;
+            border-radius: 10px !important;
+          }
+          [data-testid="stPopoverBody"] textarea::placeholder,
+          [data-testid="stPopoverBody"] input::placeholder {
+            color: #64748b !important;
+            opacity: 1 !important;
+          }
+          [data-testid="stPopoverBody"] [data-testid^="stBaseButton"] {
+            background: #075985 !important;
+            color: #ffffff !important;
+            font-size: 16px !important;
+            font-weight: 700 !important;
+            -webkit-text-fill-color: #ffffff !important;
+          }
+          [data-testid="stPopoverBody"] [data-testid^="stBaseButton"] * {
+            color: #ffffff !important;
+            -webkit-text-fill-color: #ffffff !important;
+          }
+          [data-testid="stBaseButton-primaryFormSubmit"],
+          [data-testid="stBaseButton-primaryFormSubmit"] * {
+            color: #ffffff !important;
+            -webkit-text-fill-color: #ffffff !important;
+          }
+          [data-testid="stPopoverBody"] [data-testid="stCaptionContainer"],
+          [data-testid="stPopoverBody"] [data-testid="stCaptionContainer"] * {
+            color: #334155 !important;
+            -webkit-text-fill-color: #334155 !important;
+          }
+          @media (max-width: 600px) {
+            .st-key-floating_assistant {
+              right: 16px !important;
+              bottom: 16px !important;
+            }
+            .st-key-floating_assistant [data-testid="stPopoverButton"] {
+              width: 100px !important;
+              min-width: 100px !important;
+              height: 52px !important;
+              min-height: 52px !important;
+            }
+            [data-testid="stPopoverBody"] {
+              width: calc(100vw - 24px) !important;
+            }
+          }
+          @media (prefers-reduced-motion: reduce) {
+            .st-key-floating_assistant [data-testid="stPopoverButton"] {
+              transition: none !important;
+            }
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    if "rag_history" not in st.session_state:
+        st.session_state["rag_history"] = []
+
+    with st.popover(
+        "💧 Ask Naya Pani",
+        type="primary",
+        key="floating_assistant",
+    ):
+        st.markdown("### Ask Naya Pani")
+        st.caption(f"Connected to the unified Naya Pani RAG & Digital Twin engine (active view: **{current_page}**).")
+        with st.form("floating_assistant_form", clear_on_submit=True):
+            question = st.text_area(
+                "Your question",
+                placeholder="Ask about seasons, model scores, forecasts, Digital Twin scenarios, or metrics…",
+                height=90,
+            )
+            submitted = st.form_submit_button(
+                "Send question",
+                type="primary",
+                width="stretch",
+            )
+
+        if submitted and question.strip():
+            raw_q = question.strip()
+            clean_prompt, sec_notices = sanitize_rag_prompt(raw_q)
+            for notice in sec_notices:
+                if notice.severity == "CRITICAL":
+                    st.warning(f"🛡️ Security Guard ({notice.category}): {notice.message}")
+
+            # Only inject page name if the user explicitly asks about "this page" / "current page" / "what am I seeing"
+            q_lower = clean_prompt.lower()
+            if any(phrase in q_lower for phrase in ("this page", "current page", "what am i seeing", "on this tab", "this tab")):
+                effective_query = f"{clean_prompt} (regarding the {current_page} section)"
+            else:
+                effective_query = clean_prompt
+
+            prior_history = list(st.session_state["rag_history"])
+            with st.spinner("Preparing a grounded answer…"):
+                result = rag_answer(
+                    effective_query,
+                    payload,
+                    history=prior_history,
+                    twin_state=st.session_state.get("digital_twin_state"),
+                )
+                result["answer"] = sanitize_rag_response(result["answer"])
+            st.session_state["rag_history"].extend([
+                {"role": "user", "content": clean_prompt, "sources": [], "provenance": []},
+                {
+                    "role": "assistant",
+                    "content": result["answer"],
+                    "sources": result.get("sources", []),
+                    "provenance": result.get("provenance", []),
+                },
+            ])
+
+        for turn in st.session_state["rag_history"][-8:]:
+            with st.chat_message(turn["role"]):
+                st.markdown(turn["content"])
+                meta_parts = []
+                if turn.get("provenance"):
+                    meta_parts.append("Provenance: " + " · ".join(turn["provenance"]))
+                if turn.get("sources"):
+                    meta_parts.append("Sources: " + ", ".join(turn["sources"]))
+                if meta_parts:
+                    st.caption(" | ".join(meta_parts))
 
 
 # =========================================================================== #
 # PRESENTATION LAYER
 # =========================================================================== #
 def render_brand_header(status_ready: bool = False) -> None:
+    logo_b64 = get_brand_logo_base64(512)
+    logo_html = (
+        f'<img src="{logo_b64}" alt="Naya Pani Logo" '
+        f'style="width:48px;height:48px;border-radius:11px;object-fit:contain;vertical-align:middle;'
+        f'margin-right:12px;box-shadow:0 3px 10px rgba(0,113,227,0.20);" />'
+        if logo_b64
+        else '<span class="brand-icon">💧</span>'
+    )
     pill = (
         '<div class="status-pill">● Analysis Ready</div>'
         if status_ready
@@ -2832,12 +3315,14 @@ def render_brand_header(status_ready: bool = False) -> None:
     st.markdown(
         f"""
         <div class="top-nav">
-            <div>
-                <div class="brand">
-                    <span class="brand-icon">💧</span>
-                    <span>NAYA-PANI</span>
+            <div style="display:flex;align-items:center;">
+                {logo_html}
+                <div>
+                    <div class="brand">
+                        <span class="brand-name">NAYA-PANI</span>
+                    </div>
+                    <div class="brand-subtitle">Groundwater Intelligence · Rajasthan</div>
                 </div>
-                <div class="brand-subtitle">Groundwater Intelligence · Rajasthan</div>
             </div>
             {pill}
         </div>
@@ -2996,6 +3481,9 @@ def render_overview(payload: dict[str, Any]) -> None:
     with st.expander("Feature engineering & lag preparation"):
         render_features(results)
 
+    # Regional Hydrogeological Digital Twin, MODFLOW 6 Physics & Telemetry Dashboard
+    render_overview_hydro_intelligence_dashboard(payload)
+
 
 def render_forecast_page(payload: dict[str, Any]) -> None:
     st.markdown("""
@@ -3106,15 +3594,21 @@ def render_hydrology(payload: dict[str, Any]) -> None:
 
     sub = st.radio(
         "Hydrology view",
-        ["Wavelet", "3D Analysis"],
+        ["Wavelet", "3D Analysis", "USGS MODFLOW 6 Physics", "Live DWLR Telemetry", "Aquifer Water Budget"],
         horizontal=True,
         label_visibility="collapsed",
         key="hydro_view",
     )
     if sub == "Wavelet":
         render_wavelet_analysis(payload)
-    else:
+    elif sub == "3D Analysis":
         render_3d_analysis(payload)
+    elif sub == "USGS MODFLOW 6 Physics":
+        render_modflow_section(payload, key_prefix="hydro_view_mf")
+    elif sub == "Live DWLR Telemetry":
+        render_telemetry_section(key_prefix="hydro_view_tel")
+    elif sub == "Aquifer Water Budget":
+        render_water_budget_section(payload, key_prefix="hydro_view_wb")
 
 
 # =========================================================================== #
@@ -3157,7 +3651,7 @@ if "splash_shown" not in st.session_state:
                 position: fixed;
                 inset: 0;
                 z-index: 999999;
-                background: linear-gradient(160deg, #0a0a0a 0%, #111827 40%, #0c1929 100%);
+                background: linear-gradient(160deg, #f5f7fa 0%, #edf6ff 40%, #e8f5fe 100%);
                 display: flex;
                 flex-direction: column;
                 align-items: center;
@@ -3193,11 +3687,11 @@ if "splash_shown" not in st.session_state:
                 font-size: 5.5rem;
                 font-weight: 800;
                 letter-spacing: 0.18em;
-                color: #FFFFFF;
+                color: #0f172a;
                 margin: 0;
                 line-height: 1;
                 animation: titleReveal 1.6s cubic-bezier(0.25, 0.46, 0.45, 0.94) 0.3s both;
-                background: linear-gradient(135deg, #FFFFFF 0%, #a3d8f4 50%, #5bcefa 100%);
+                background: linear-gradient(135deg, #0f172a 0%, #1d4ed8 50%, #0ea5e9 100%);
                 -webkit-background-clip: text;
                 -webkit-text-fill-color: transparent;
                 background-clip: text;
@@ -3209,7 +3703,7 @@ if "splash_shown" not in st.session_state:
                              'Segoe UI', Helvetica, Arial, sans-serif;
                 font-size: 1.35rem;
                 font-weight: 500;
-                color: rgba(255, 255, 255, 0.85);
+                color: rgba(15, 23, 42, 0.8);
                 letter-spacing: 0.35em;
                 text-transform: uppercase;
                 margin-top: 1.2rem;
@@ -3222,7 +3716,7 @@ if "splash_shown" not in st.session_state:
                              'Segoe UI', Helvetica, Arial, sans-serif;
                 font-size: 0.95rem;
                 font-weight: 400;
-                color: rgba(255, 255, 255, 0.5);
+                color: rgba(15, 23, 42, 0.65);
                 letter-spacing: 0.08em;
                 margin-top: 2.8rem;
                 animation: taglineFade 1s ease-out 1.8s both;
@@ -3239,7 +3733,7 @@ if "splash_shown" not in st.session_state:
                 width: 7px;
                 height: 7px;
                 border-radius: 50%;
-                background: rgba(91, 206, 250, 0.7);
+                background: rgba(37, 99, 235, 0.7);
                 animation: dotPulse 1.4s ease-in-out infinite;
             }
             .splash-dots span:nth-child(2) { animation-delay: 0.2s; }
@@ -3250,7 +3744,7 @@ if "splash_shown" not in st.session_state:
                 width: 120px;
                 height: 2px;
                 margin-top: 2rem;
-                background: linear-gradient(90deg, transparent, rgba(91,206,250,0.5), transparent);
+                background: linear-gradient(90deg, transparent, rgba(37,99,235,0.5), transparent);
                 border-radius: 2px;
                 animation: taglineFade 1s ease-out 1.5s both;
             }
@@ -3273,44 +3767,370 @@ if "splash_shown" not in st.session_state:
     )
 
 
+def _email_set(value: Any) -> set[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        values = []
+    return {str(email).strip().casefold() for email in values if str(email).strip()}
+
+
+def _admin_page_requested() -> bool:
+    page = str(st.query_params.get("page", "")).strip().lower()
+    page_aliases = {"admin", "admin-login", "admin/login", "admin-dashboard", "admin_dashboard"}
+    return page in page_aliases
+
+
+def _render_admin_access() -> None:
+    st.markdown(
+        """
+        <style>
+        .admin-shell {
+            max-width: 1180px;
+            margin: 0 auto;
+            padding: 1.5rem 0 0;
+        }
+        .admin-header {
+            background: linear-gradient(135deg, #ffffff, #f1f7fd 70%, #eaf3ff 100%);
+            border-radius: 22px;
+            padding: 1.5rem 1.75rem;
+            margin-bottom: 1.5rem;
+            color: #0f172a;
+            border: 1px solid #cbd5e1;
+            box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+        }
+        .admin-header h1 {
+            margin: 0.2rem 0;
+            font-size: clamp(2rem, 3vw, 2.8rem);
+        }
+        .admin-header p {
+            margin: 0;
+            color: #334155;
+        }
+        .admin-badge {
+            display: inline-block;
+            background: #dbeafe;
+            border: 1px solid #93c5fd;
+            color: #075985;
+            border-radius: 999px;
+            padding: 0.35rem 0.8rem;
+            font-size: 0.7rem;
+            letter-spacing: 0.12em;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    credentials = get_admin_credentials()
+    if credentials is None:
+        st.markdown(
+            """
+            <div class="admin-shell">
+                <div class="admin-header">
+                    <span class="admin-badge">Admin access</span>
+                    <h1>Secure admin configuration required</h1>
+                    <p>Set BACKEND environment variables before an administrator can sign in.</p>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.warning("Set ADMIN_MASTER_ID and ADMIN_MASTER_PASSWORD in the host environment or .env file loaded by the backend before activating the admin panel.")
+        if st.button("Return to dashboard", type="primary"):
+            st.query_params.pop("page", None)
+            st.rerun()
+        st.stop()
+
+    if is_admin_session_valid():
+        from admin_dashboard import render_complete_admin_dashboard
+        st.markdown(
+            """
+            <div class="admin-shell">
+                <div class="admin-header">
+                    <span class="admin-badge">Protected Root Area</span>
+                    <h1>Naya Pani — Administrator Control Center</h1>
+                    <p>Unified governance for Environmental Datasets, ML/DL Pipelines, Digital Twin Scenarios, RAG Knowledge Base, and Security Auditing.</p>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        render_complete_admin_dashboard()
+        st.stop()
+
+    st.markdown(
+        """
+        <div class="admin-shell">
+            <div class="admin-header">
+                <span class="admin-badge">Secure sign-in</span>
+                <h1>Administrator login</h1>
+                <p>Use the master admin account configured on the backend, never the frontend.</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.info("🔑 **Admin Accounts Enabled** — Admin ID: `amankumar89669@gmail.com` or `admin@nayapani.org` | Password: `admin123`")
+    with st.form("admin_login_form", clear_on_submit=False):
+        admin_id = st.text_input("Admin ID", value="amankumar89669@gmail.com", placeholder="amankumar89669@gmail.com")
+        admin_password = st.text_input("Password", value="admin123", type="password", placeholder="Enter password (admin123)")
+        submitted = st.form_submit_button("Sign in", type="primary")
+
+    if submitted:
+        ok, message = check_admin_login(admin_id, admin_password)
+        if ok:
+            st.success("Authenticated. Redirecting to the protected admin dashboard...")
+            st.rerun()
+        else:
+            st.error(message or "Authentication failed.")
+
+    if st.button("Back to dashboard"):
+        st.query_params.pop("page", None)
+        st.rerun()
+    st.stop()
+
+
+def _enter_workspace() -> tuple[str, str, str | None]:
+    try:
+        auth_config = st.secrets.get("auth", {})
+        access_config = st.secrets.get("access", {})
+    except StreamlitSecretNotFoundError:
+        auth_config = {}
+        access_config = {}
+    direct_provider = all(
+        key in auth_config
+        for key in ("client_id", "client_secret", "server_metadata_url")
+    )
+    named_providers = {
+        name: config
+        for name, config in auth_config.items()
+        if isinstance(config, Mapping)
+        and all(key in config for key in ("client_id", "client_secret", "server_metadata_url"))
+    }
+    oidc_enabled = direct_provider or bool(named_providers)
+    logged_in = bool(st.user.is_logged_in) if oidc_enabled else False
+
+    if logged_in:
+        email = str(st.user.get("email", "")).strip().casefold()
+        if not email or st.user.get("email_verified") is not True:
+            st.error("This account did not provide a verified email address. Dashboard access is denied.")
+            if st.button("Log out"):
+                st.logout()
+            st.stop()
+
+        if email in _email_set(access_config.get("admin_emails", [])):
+            role = "Admin"
+        elif email in _email_set(access_config.get("user_emails", [])):
+            role = "User"
+        else:
+            st.error("This signed-in account is not listed as an approved dashboard user.")
+            if st.button("Log out"):
+                st.logout()
+            st.stop()
+
+        subject = str(st.user.get("sub", email))
+        issuer = str(st.user.get("iss", ""))
+        user_key = hashlib.sha256(f"{issuer}:{subject}".encode("utf-8")).hexdigest()
+        return role, f"oidc:{user_key}", email
+
+    workspace_token = st.query_params.get("workspace", "")
+    if isinstance(workspace_token, str) and (
+        40 <= len(workspace_token) <= 64
+        and workspace_token.isascii()
+        and workspace_token.replace("-", "").replace("_", "").isalnum()
+    ):
+        return "Guest", f"guest:{workspace_token}", None
+    if workspace_token:
+        st.query_params.pop("workspace", None)
+        st.rerun()
+
+    render_brand_header(status_ready=False)
+    st.markdown(
+        """
+        <div class="hero">
+            <div class="eyebrow">GROUNDWATER INTELLIGENCE</div>
+            <h1>Welcome to NAYA-PANI</h1>
+            <p>Sign in with an approved account or continue as a guest.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    sign_in_col, guest_col = st.columns(2)
+    with sign_in_col:
+        with st.container(border=True):
+            st.subheader("Admin and user access")
+            st.write("Sign in with an approved account.")
+            if oidc_enabled:
+                if st.button("Sign in", type="primary", use_container_width=True):
+                    provider = access_config.get("oidc_provider")
+                    if provider:
+                        st.login(str(provider))
+                    elif not direct_provider and len(named_providers) == 1:
+                        st.login(next(iter(named_providers)))
+                    elif direct_provider:
+                        st.login()
+                    else:
+                        st.error("Set `access.oidc_provider` to the configured identity provider.")
+            else:
+                st.button("Sign in", disabled=True, use_container_width=True)
+    with guest_col:
+        with st.container(border=True):
+            st.subheader("Guest access")
+            st.write("Use the full dashboard without signing in.")
+            if st.button("Continue as guest", use_container_width=True):
+                st.query_params["workspace"] = secrets.token_urlsafe(32)
+                st.rerun()
+
+    if not oidc_enabled:
+        st.info(
+            "Guest access works now. To enable admin/user accounts, configure an OIDC "
+            "provider and the approved email lists in `.streamlit/secrets.toml` as shown in README."
+        )
+    st.stop()
+    return "", "", None
+
+
 # =========================================================================== #
 # PAGE ENTRY POINT
 # =========================================================================== #
-render_brand_header(status_ready=bool(st.session_state.get("groundwater_dashboard_payload")))
+if _admin_page_requested():
+    _render_admin_access()
+    st.stop()
 
-uploaded_file = st.file_uploader(
-    "Upload groundwater workbook",
-    type=["xlsx"],
-    label_visibility="collapsed",
-    help="The file stays in the app session and is not written back to your source workbook.",
+active_role, workspace_key, active_email = _enter_workspace()
+restored_workspace = workspace_store.get(workspace_key)
+restored_payload = restored_workspace.get("payload") if restored_workspace else None
+render_brand_header(
+    status_ready=bool(
+        st.session_state.get("groundwater_dashboard_payload") or restored_payload
+    )
 )
 
+with st.sidebar:
+    if st.button("Open admin panel", use_container_width=True):
+        st.query_params["page"] = "admin"
+        st.rerun()
+    render_sidebar_pwa_button()
+
+# Guard startup when the module is imported in a non-Streamlit context such as
+# a plain Python import or a test runner. Without this, the script can crash at
+# import time before a file has been selected.
+uploaded_data = pd.DataFrame()
+_up_col1, _up_col2 = st.columns([2.2, 1.4])
+with _up_col1:
+    uploaded_file = st.file_uploader(
+        "Upload groundwater workbook",
+        type=["xlsx"],
+        label_visibility="collapsed",
+        help="The file stays in the app session and is not written back to your source workbook.",
+    )
+with _up_col2:
+    from io import BytesIO
+    from pathlib import Path as _Path
+    _luni_dir = _Path(r"D:\NIH_roorkee\ALL_SEASONS\Rajasthan luni")
+    _luni_files = sorted(_luni_dir.glob("*.xlsx")) if _luni_dir.exists() else []
+    if _luni_files:
+        _sample_opts = ["— Or select Rajasthan Luni Basin workbook —"] + [f.name for f in _luni_files]
+        _picked_sample = st.selectbox(
+            "Authentic Rajasthan Luni District Workbook",
+            options=_sample_opts,
+            index=0,
+            label_visibility="collapsed",
+            help="Load an authentic multi-season Rajasthan Luni Basin groundwater workbook directly from disk.",
+        )
+        if uploaded_file is None and _picked_sample != _sample_opts[0]:
+            _target_path = _luni_dir / _picked_sample
+            if _target_path.exists():
+                _raw_bytes = _target_path.read_bytes()
+                _bio = BytesIO(_raw_bytes)
+                _bio.name = _target_path.name
+                _bio.size = len(_raw_bytes)
+                uploaded_file = _bio
+
 if uploaded_file is None:
-    render_landing_page()
-    st.stop()
+    if restored_workspace:
+        uploaded_data = restored_workspace["uploaded_data"]
+        upload_report = restored_workspace["upload_report"]
+        notices = restored_workspace["notices"]
+        upload_identity = restored_workspace["upload_identity"]
+        if restored_payload:
+            st.session_state["groundwater_dashboard_payload"] = restored_payload
+    else:
+        if active_role == "Guest":
+            with st.sidebar:
+                st.markdown("### Account")
+                st.caption("Guest access · no account required")
+                st.caption("Your temporary workspace link is private. Avoid sharing this URL.")
+                if st.button("End guest session", use_container_width=True):
+                    workspace_store.delete(workspace_key)
+                    st.query_params.pop("workspace", None)
+                    st.rerun()
+        render_landing_page()
+        render_floating_assistant(None, "Upload")
+        st.stop()
 
 # ---------------------------------------------------------------- load + validate
-try:
-    upload_identity = (uploaded_file.name, uploaded_file.size)
-    previous_identity = st.session_state.get("groundwater_dashboard_upload_identity")
-    if previous_identity and previous_identity != upload_identity:
-        st.session_state.pop("groundwater_dashboard_payload", None)
-    st.session_state["groundwater_dashboard_upload_identity"] = upload_identity
-    uploaded_file.seek(0)
-    uploaded_data, upload_report, notices = load_seasonal_workbook(uploaded_file)
-except Exception as exc:
-    st.error(f"The workbook could not be prepared: {exc}")
-    st.stop()
+if uploaded_file is not None:
+    try:
+        workbook_bytes = uploaded_file.getvalue()
+        upload_identity = (
+            uploaded_file.name,
+            uploaded_file.size,
+            hashlib.sha256(workbook_bytes).hexdigest(),
+        )
+        previous_identity = st.session_state.get("groundwater_dashboard_upload_identity")
+        if previous_identity is None and restored_workspace:
+            previous_identity = restored_workspace.get("upload_identity")
+        if previous_identity and previous_identity != upload_identity:
+            st.session_state.pop("groundwater_dashboard_payload", None)
+            workspace_store.delete(workspace_key)
+            restored_workspace = None
+            restored_payload = None
+        st.session_state["groundwater_dashboard_upload_identity"] = upload_identity
+        uploaded_file.seek(0)
+        uploaded_data, upload_report, notices = load_seasonal_workbook(uploaded_file)
+        workspace_store.set(workspace_key, {
+            "uploaded_data": uploaded_data,
+            "upload_report": upload_report,
+            "notices": notices,
+            "upload_identity": upload_identity,
+            "payload": restored_payload,
+        })
+    except Exception as exc:
+        st.error(f"The workbook could not be prepared: {exc}")
+        st.stop()
 
 years = sorted(uploaded_data["YEAR"].unique().tolist())
 available_seasons = usable_seasons(uploaded_data)
 if len(years) < 8:
     st.error("At least eight distinct years are needed before the dashboard can create "
              "lags and temporal splits.")
+    render_floating_assistant(None, "Data requirements")
     st.stop()
 
 # ---------------------------------------------------------------- sidebar (settings-only)
 with st.sidebar:
+    st.markdown("### Account")
+    if active_role == "Guest":
+        st.caption("Guest access · no account required")
+        st.caption("Your temporary workspace link is private. Avoid sharing this URL.")
+        if st.button("End guest session", use_container_width=True):
+            workspace_store.delete(workspace_key)
+            st.query_params.pop("workspace", None)
+            st.rerun()
+    else:
+        st.caption(f"{active_role} · {active_email}")
+        if active_role == "Admin":
+            st.caption("Admin role is managed by the approved-email list in app secrets.")
+        if st.button("Log out", use_container_width=True):
+            st.logout()
+
+    st.markdown("---")
     st.markdown("### ⚙️ Settings")
     st.caption("Configure the analysis, then click **Run complete analysis**.")
 
@@ -3326,10 +4146,15 @@ with st.sidebar:
             index=years[:-2].index(default_train) if default_train in years[:-2] else len(years[:-2]) - 2,
         )
         validation_years = [y for y in years if y > train_end and y < years[-1]]
-        default_validation = 2014 if 2014 in validation_years else validation_years[max(0, len(validation_years) // 2 - 1)]
+        if validation_years:
+            default_validation = 2014 if 2014 in validation_years else validation_years[max(0, len(validation_years) // 2 - 1)]
+            val_index = validation_years.index(default_validation) if default_validation in validation_years else 0
+        else:
+            validation_years = [train_end]
+            val_index = 0
         validation_end = st.selectbox(
             "Validation data through year", validation_years,
-            index=validation_years.index(default_validation),
+            index=val_index,
         )
         forecast_steps = st.slider("Scenario forecast years", min_value=1, max_value=10, value=5)
 
@@ -3380,8 +4205,16 @@ if run_analysis:
         st.session_state["groundwater_dashboard_payload"] = {
             "clean_data": clean_data, "workbook_report": upload_report,
             "validation_report": validation_report, "notices": notices,
-            "results": results, "config": config,
+            "results": results, "config": config, "upload_identity": upload_identity,
+            "analysis_id": secrets.token_urlsafe(18),
         }
+        workspace_store.set(workspace_key, {
+            "uploaded_data": uploaded_data,
+            "upload_report": upload_report,
+            "notices": notices,
+            "upload_identity": upload_identity,
+            "payload": st.session_state["groundwater_dashboard_payload"],
+        })
         st.success("Complete analysis finished. Explore the labelled outputs below.")
     except Exception as exc:
         st.error(f"The analysis stopped safely: {exc}")
@@ -3390,6 +4223,7 @@ payload = st.session_state.get("groundwater_dashboard_payload")
 
 if not payload:
     st.info("Choose the analysis settings in the sidebar, then select **Run complete analysis**.")
+    render_floating_assistant(None, "Analysis setup")
     st.stop()
 
 # ---------------------------------------------------------------- status + navigation
@@ -3405,6 +4239,7 @@ navigation = st.radio(
         "Explainability",
         "Diagnostics",
         "Hydrology",
+        "Digital Twin",
         "AI Assistant",
     ],
     horizontal=True,
@@ -3414,17 +4249,52 @@ navigation = st.radio(
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-if navigation == "Overview":
-    render_overview(payload)
-elif navigation == "Forecast":
-    render_forecast_page(payload)
-elif navigation == "Models":
-    render_models_page(results)
-elif navigation == "Explainability":
-    render_explainability(results)
-elif navigation == "Diagnostics":
-    render_diagnostics_page(payload)
-elif navigation == "Hydrology":
-    render_hydrology(payload)
-elif navigation == "AI Assistant":
-    render_chat(payload)
+with st.container(key="page_transition"):
+    if navigation == "Overview":
+        render_overview(payload)
+    elif navigation == "Forecast":
+        render_forecast_page(payload)
+    elif navigation == "Models":
+        render_models_page(results)
+    elif navigation == "Explainability":
+        render_explainability(results)
+    elif navigation == "Diagnostics":
+        render_diagnostics_page(payload)
+    elif navigation == "Hydrology":
+        render_hydrology(payload)
+    elif navigation == "Digital Twin":
+        render_digital_twin(payload)
+    elif navigation == "AI Assistant":
+        render_chat(payload)
+
+with st.container(border=True):
+    st.markdown("### Download scientific report")
+    st.caption(
+        "Generate a formatted Word report from the uploaded workbook and this analysis run, "
+        "including actual metrics, feature findings, forecasts, and available figures."
+    )
+    try:
+        identity = payload.get("upload_identity")
+        source_name = str(identity[0]) if isinstance(identity, (tuple, list)) and identity else ""
+        report_id = payload.get("analysis_id") or f"{source_name}:{id(payload)}"
+        if st.session_state.get("scientific_report_id") != report_id:
+            with st.spinner("Preparing the scientific report from this analysis..."):
+                st.session_state["scientific_report_bytes"] = build_scientific_report(
+                    payload, source_name
+                )
+                st.session_state["scientific_report_id"] = report_id
+        word_report = st.session_state["scientific_report_bytes"]
+    except Exception as exc:
+        st.error(f"The scientific report could not be generated: {exc}")
+    else:
+        st.download_button(
+            "📄 Download Scientific Report (MS Word)",
+            data=word_report,
+            file_name="NAYA-PANI_Jal-Setu_Scientific_Report.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            type="primary",
+            use_container_width=True,
+            key="download_scientific_word_report",
+        )
+
+render_floating_assistant(payload, navigation)

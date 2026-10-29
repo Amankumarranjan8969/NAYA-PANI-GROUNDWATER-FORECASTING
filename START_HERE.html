@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Naya Pani - Portable Quick Start Guide</title>
+    <style>
+        :root {
+            --primary: #0284c7;
+            --primary-dark: #0369a1;
+            --accent: #10b981;
+            --bg: #0f172a;
+            --card-bg: #1e293b;
+            --text: #f8fafc;
+            --text-muted: #94a3b8;
+            --border: #334155;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            padding: 40px 20px;
+        }
+        .container {
+            max-width: 960px;
+            margin: 0 auto;
+        }
+        header {
+            text-align: center;
+            margin-bottom: 40px;
+            padding-bottom: 30px;
+            border-bottom: 1px solid var(--border);
+        }
+        .badge {
+            display: inline-block;
+            background: rgba(2, 132, 199, 0.2);
+            color: #38bdf8;
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            padding: 4px 12px;
+            border-radius: 9999px;
+            font-size: 12px;
+            font-weight: 600;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            margin-bottom: 16px;
+        }
+        h1 {
+            font-size: 36px;
+            font-weight: 800;
+            margin-bottom: 12px;
+            background: linear-gradient(135deg, #38bdf8 0%, #818cf8 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        p.subtitle {
+            font-size: 18px;
+            color: var(--text-muted);
+            max-width: 700px;
+            margin: 0 auto;
+        }
+        .hero-action {
+            background: linear-gradient(135deg, rgba(2, 132, 199, 0.15) 0%, rgba(99, 102, 241, 0.15) 100%);
+            border: 2px solid #0284c7;
+            border-radius: 16px;
+            padding: 30px;
+            margin-bottom: 40px;
+            text-align: center;
+        }
+        .btn-large {
+            display: inline-block;
+            background: #0284c7;
+            color: white;
+            padding: 16px 36px;
+            border-radius: 10px;
+            font-size: 18px;
+            font-weight: 700;
+            text-decoration: none;
+            box-shadow: 0 4px 14px rgba(2, 132, 199, 0.4);
+            margin: 15px 0 10px 0;
+            transition: all 0.2s ease;
+        }
+        .btn-large:hover {
+            background: var(--primary-dark);
+            transform: translateY(-2px);
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+            margin-bottom: 40px;
+        }
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+        }
+        .card h3 {
+            font-size: 18px;
+            margin-bottom: 10px;
+            color: #38bdf8;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .card p, .card ul {
+            font-size: 14px;
+            color: var(--text-muted);
+        }
+        .card ul {
+            list-style: none;
+            padding-left: 0;
+            margin-top: 10px;
+        }
+        .card ul li {
+            padding: 6px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+        .card ul li:last-child { border-bottom: none; }
+        code {
+            background: #0b1120;
+            color: #38bdf8;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: Consolas, monospace;
+            font-size: 13px;
+        }
+        .sample-list {
+            background: #0b1120;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            margin-top: 12px;
+        }
+        .sample-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+            font-size: 13px;
+        }
+        .sample-item:last-child { border-bottom: none; }
+        footer {
+            text-align: center;
+            margin-top: 50px;
+            padding-top: 20px;
+            border-top: 1px solid var(--border);
+            color: var(--text-muted);
+            font-size: 13px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="badge">Standalone Portable Edition</div>
+            <h1>NAYA PANI Groundwater Digital Twin</h1>
+            <p class="subtitle">Seasonal AI Forecasting, USGS MODFLOW 6 Numerical Physics, Live DWLR IoT Telemetry, and Photorealistic 3D Geospatial Simulation.</p>
+        </header>
+
+        <div class="hero-action">
+            <h2 style="font-size: 24px; margin-bottom: 8px;">🚀 How to Start in One Click</h2>
+            <p style="color: #cbd5e1; font-size: 15px;">Simply double-click <code>START_NAYA_PANI.bat</code> inside this folder!</p>
+            <div style="margin: 16px 0;">
+                <span style="background: #0f172a; padding: 12px 24px; border-radius: 8px; font-family: monospace; font-size: 16px; color: #38bdf8; border: 1px solid var(--border);">
+                    ▶ START_NAYA_PANI.bat
+                </span>
+            </div>
+            <p style="font-size: 13px; color: #94a3b8;">The launcher checks Python, creates the local virtual environment (.venv), installs dependencies, and opens <strong>http://localhost:8501</strong> in your browser automatically.</p>
+        </div>
+
+        <div class="grid">
+            <div class="card">
+                <h3>🌊 USGS MODFLOW 6 Physics</h3>
+                <p>Physics-informed finite-difference numerical solver for 3D groundwater flow across 5 stratigraphy layers (40&times;40 structured grid, 50 km regional domain). Download runnable USGS MODFLOW 6 package bundles.</p>
+            </div>
+            <div class="card">
+                <h3>🌐 Photorealistic 3D Twin</h3>
+                <p>True 3D regional world with real Digital Elevation Model (DEM), xerophytic Thar desert vegetation, real 3D tree OBJ meshes, satellite texturing, dynamic weather simulation, and 3D solute transport plumes.</p>
+            </div>
+            <div class="card">
+                <h3>🏛️ CGWA Statutory Audit</h3>
+                <p>Automated Central Ground Water Authority statutory assessment per GEC-2015 methodology. Computes Stage of Groundwater Extraction (SOGWE %), NOC abstraction compliance, and Managed Aquifer Recharge (MAR) ranking.</p>
+            </div>
+            <div class="card">
+                <h3>📡 Live DWLR IoT Telemetry</h3>
+                <p>Real-time Digital Water Level Recorder telemetry stream with automated Edge QA/QC anomaly filtering (rate-of-change spike rejection, battery health cutoff, and physical bound verification).</p>
+            </div>
+            <div class="card">
+                <h3>🤖 RAG Knowledge Copilot</h3>
+                <p>Context-aware AI assistant synchronized with live 3D Digital Twin simulation states, physical bounds, LOFO sensitivity rankings, and grounded scientific hydrogeological documentation.</p>
+            </div>
+            <div class="card">
+                <h3>📊 Multi-Model ML/DL Suite</h3>
+                <p>Compare SVR, Random Forest, GBDT, CatBoost, XGBoost, LightGBM, Physics-Informed Neural Networks (PINN), Echo State Networks (ESN), SARIMA, and LSTM deep learning models.</p>
+            </div>
+        </div>
+
+        <div class="card" style="margin-bottom: 30px;">
+            <h3>📁 Ready-to-Use Sample Datasets Included</h3>
+            <p>You can drag and drop any of these workbooks directly into the Naya Pani web dashboard to start analyzing immediately:</p>
+            <div class="sample-list">
+                <div class="sample-item">
+                    <span><strong>sample_data/Ajmer_Luni.xlsx</strong> &mdash; Ajmer district, Pisangan block (116 records)</span>
+                    <span style="color: #10b981;">✓ Validated</span>
+                </div>
+                <div class="sample-item">
+                    <span><strong>sample_data/Barmer_Luni2.xlsx</strong> &mdash; Barmer arid regional basin, Balotra block</span>
+                    <span style="color: #10b981;">✓ Validated</span>
+                </div>
+                <div class="sample-item">
+                    <span><strong>sample_data/Jodhpur_Luni.xlsx</strong> &mdash; Jodhpur semi-arid Thar desert basin</span>
+                    <span style="color: #10b981;">✓ Validated</span>
+                </div>
+                <div class="sample-item">
+                    <span><strong>sample_data/Pali_Luni2.xlsx</strong> &mdash; Pali central alluvium monitoring network</span>
+                    <span style="color: #10b981;">✓ Validated</span>
+                </div>
+                <div class="sample-item">
+                    <span><strong>sample_data/Rajsamand_Luni.xlsx</strong> &mdash; Rajsamand upper catchment headwaters</span>
+                    <span style="color: #10b981;">✓ Validated</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>⚡ Launcher Utilities Reference</h3>
+            <ul>
+                <li><code>START_NAYA_PANI.bat</code> &mdash; Main 1-click launcher for the entire platform (Streamlit, 3D Twin, MODFLOW 6, REST API).</li>
+                <li><code>START_3D_TWIN_ONLY.bat</code> &mdash; Quick standalone viewer for the 3D Digital Twin without running ML pipelines.</li>
+                <li><code>INSTALL_DEPENDENCIES.bat</code> &mdash; Optional script to manually install/update dependencies.</li>
+                <li><code>RUN_TESTS.bat</code> &mdash; Runs the automated test suite to verify 100% functionality on your laptop.</li>
+            </ul>
+        </div>
+
+        <footer>
+            <p>NAYA PANI &bull; Groundwater Intelligence Platform &bull; Developed for NIH Roorkee &amp; Ministry of Jal Shakti Initiatives</p>
+        </footer>
+    </div>
+</body>
+</html>

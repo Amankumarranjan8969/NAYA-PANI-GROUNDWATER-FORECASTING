@@ -1,0 +1,3310 @@
+"""digital_twin.py — Interactive, OpenUSD-Inspired 3D Hydrogeological Digital Twin
+for NAYA-PANI (Rajasthan Seasonal Groundwater Intelligence).
+
+Integrates:
+1. Authoritative Workbook Geospatial & Elevation Data (with explicit fallback to
+   labelled Conceptual Cutaway when coordinates are absent).
+2. Per-Asset Monitoring Well Selection, 3D Borehole Columns, and Focus Camera.
+3. Coupled Empirical (ML + Deep/PINN) & Physical Vadose-Aquifer Simulation Engine.
+4. Temporal Time-Step Playback, Scenario Presets, and Before-vs-After Comparison.
+5. Synchronized Central State (`st.session_state["digital_twin_state"]`) connected
+   directly to the Naya Pani RAG Assistant.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+import json
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import streamlit.components.v1 as components
+
+from pipeline import TARGET
+from rag.assistant import answer as rag_answer
+from security_engine import sanitize_rag_prompt, sanitize_rag_response
+from twin_engine import (
+    PROVENANCE_FORECAST,
+    PROVENANCE_ILLUSTRATIVE,
+    PROVENANCE_OBSERVED,
+    PROVENANCE_SIMULATED,
+    SCENARIO_PRESETS,
+    build_asset_catalog,
+    build_openusd_scene_hierarchy,
+    calculate_sustainable_water_budget,
+    classify_water_stress,
+    export_openusd_stage,
+    inspect_selected_asset,
+    log_twin_scenario_change,
+    mean_col,
+    run_coupled_simulation,
+    safe_float,
+    validate_simready_hydro_assets,
+)
+
+TWIN_SURFACE = "#F8FAFC"
+
+
+def _number(value: Any, digits: int = 2) -> str:
+    try:
+        value = float(value)
+        return f"{value:,.{digits}f}" if np.isfinite(value) else "Not available"
+    except (TypeError, ValueError):
+        return "Not available"
+
+
+def _twin_style() -> None:
+    st.markdown(
+        """
+        <style>
+          .twin-shell {
+            background: linear-gradient(135deg, #ffffff 0%, #eff6fb 100%);
+            border: 1px solid #cbd5e1;
+            border-radius: 18px;
+            padding: 22px 26px;
+            color: #1e293b;
+            margin-bottom: 18px;
+            box-shadow: 0 10px 26px rgba(15, 23, 42, .06);
+          }
+          .twin-shell .twin-kicker {
+            font: 700 11px/1.3 Inter, sans-serif;
+            letter-spacing: .18em;
+            color: #075985 !important;
+          }
+          .twin-shell .twin-title {
+            font: 750 28px/1.15 Inter, sans-serif;
+            margin: 7px 0 6px;
+            color: #0f172a !important;
+          }
+          .twin-shell p.twin-copy {
+            color: #334155 !important;
+            margin: 0;
+            max-width: 880px;
+            font-size: 14.5px;
+            line-height: 1.6;
+          }
+          .twin-badges {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 14px;
+          }
+          .twin-status {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 5px 11px;
+            border: 1px solid #6ee7b7;
+            background: #ecfdf5;
+            color: #065f46 !important;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: .05em;
+          }
+          .twin-prov-badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 5px 11px;
+            border: 1px solid #93c5fd;
+            background: #eff6ff;
+            color: #1e40af !important;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 700;
+          }
+          .twin-note {
+            color: #334155;
+            font-size: 13px;
+            line-height: 1.5;
+            margin-top: 6px;
+          }
+          .twin-panel {
+            background: #f8fafc;
+            border: 1px solid #cbd5e1;
+            border-radius: 12px;
+            padding: 14px 16px;
+            color: #1e293b;
+            margin-bottom: 10px;
+          }
+          .twin-panel b { color: #0f172a; }
+          .twin-asset-card {
+            background: #ffffff;
+            border: 1px solid #cbd5e1;
+            border-radius: 14px;
+            padding: 16px 18px;
+            color: #0f172a;
+            box-shadow: 0 4px 14px rgba(15, 23, 42, .04);
+          }
+          .twin-usd-path {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            font-size: 11.5px;
+            color: #0369a1;
+            background: #f0f9ff;
+            border: 1px solid #bae6fd;
+            border-radius: 6px;
+            padding: 3px 8px;
+            display: inline-block;
+            margin-top: 4px;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _interpolate_idw_grid(
+    x_pts: np.ndarray,
+    y_pts: np.ndarray,
+    values: np.ndarray,
+    grid_x: np.ndarray,
+    grid_y: np.ndarray,
+    power: float = 2.0,
+) -> np.ndarray:
+    """Inverse-Distance Weighting (IDW) interpolation for spatial well observations."""
+    valid = np.isfinite(x_pts) & np.isfinite(y_pts) & np.isfinite(values)
+    if valid.sum() < 3:
+        mean_v = float(np.nanmean(values)) if np.isfinite(values).any() else 0.0
+        return np.full_like(grid_x, mean_v, dtype=float)
+    xp, yp, vp = x_pts[valid], y_pts[valid], values[valid]
+    gx_flat = grid_x.ravel()[:, None]
+    gy_flat = grid_y.ravel()[:, None]
+    dist2 = (gx_flat - xp[None, :]) ** 2 + (gy_flat - yp[None, :]) ** 2
+    weights = 1.0 / np.maximum(dist2, 1e-4) ** (power / 2.0)
+    weights /= weights.sum(axis=1, keepdims=True)
+    interp = (weights @ vp).reshape(grid_x.shape)
+    return interp
+
+
+def _has_layer(layers: dict[str, bool], *keys: str) -> bool:
+    """Helper to check layer visibility across descriptive and legacy keys."""
+    for k in keys:
+        if k in layers:
+            return bool(layers[k])
+    return True
+
+
+def _scene(
+    frame: pd.DataFrame,
+    state: dict[str, float | None],
+    layers: dict[str, bool],
+    selected_village: str = "All villages (Basin Aggregate)",
+    camera_preset: str = "📐 Elevated Isometric View (Default)",
+    baseline_dtwl: float | None = None,
+    mode: str = "Observed",
+    stress_thresholds: tuple[float, float, float] = (10.0, 20.0, 35.0),
+    ambiance: str = "☀️ High Noon Thar Sun",
+    exaggeration: float = 1.5,
+    cutaway_mode: str = "Complete Surface Landscape",
+) -> go.Figure:
+    """Build an interactive, photorealistic 3D hydrogeological Thar Desert digital twin scene.
+
+    Accurately sculpts authentic Western Rajasthan aeolian geomorphology:
+    - SW-to-NE Longitudinal (Seif) Sand Dunes & Asymmetric Barchanoid Ridges
+    - Wind-blown sand ripples and low-lying Interdunal Swales (Pats / Playas)
+    - Data-bound DEM Elevation surface from workbook WGS84 piezometers
+    - Authentic Rajasthan Basin stratigraphy (Aeolian sand -> Vadose calcrete -> Luni-Lathi Aquifer -> Malani bedrock)
+    - Sparse Thar xerophytic vegetation (Khejri trees, Rohida shrubs, Sewan tussock grass)
+    - The Luni Ephemeral Riverbed (dry sandy wadi with Pachpadra-style saline efflorescence crusts,
+      filling with braided turquoise water during monsoon forcing)
+    - Traditional Thar rainwater harvesting structures (Khadin & Tanka catchments)
+    - Desert solar-powered piezometer telemetry stations with stress-coded LED beacons
+    """
+    # High-density 64x64 grid for crisp, fluid dune morphology without performance degradation
+    xx, yy = np.meshgrid(np.linspace(-1.0, 1.0, 64), np.linspace(-1.0, 1.0, 64))
+    wells = frame.dropna(subset=[TARGET]).copy()
+    has_coords = (
+        {"LATITUDE", "LONGITUDE"}.issubset(wells.columns)
+        and wells[["LATITUDE", "LONGITUDE"]].notna().all(axis=1).any()
+    )
+    has_elev = "Elevation" in wells.columns and wells["Elevation"].notna().any()
+
+    # Aggregate unique villages in the current slice so each monitoring well is a distinct 3D asset
+    if has_coords:
+        wells_valid = wells.dropna(subset=["LATITUDE", "LONGITUDE"]).copy()
+        agg_spec: dict[str, Any] = {
+            "LATITUDE": "mean",
+            "LONGITUDE": "mean",
+            TARGET: "mean",
+        }
+        for opt_col in ("Elevation", "Rainfall", "ET", "NDVI", "Avg_SM", "DISTRICT", "BLOCK"):
+            if opt_col in wells_valid.columns:
+                agg_spec[opt_col] = "first" if opt_col in ("DISTRICT", "BLOCK") else "mean"
+        well_assets = wells_valid.groupby("VILLAGE", as_index=False).agg(agg_spec)
+        lat = well_assets["LATITUDE"].to_numpy(dtype=float)
+        lon = well_assets["LONGITUDE"].to_numpy(dtype=float)
+        lon_span = max(float(np.ptp(lon)), 1e-4)
+        lat_span = max(float(np.ptp(lat)), 1e-4)
+        wx = 1.6 * ((lon - float(np.mean(lon))) / lon_span)
+        wy = 1.6 * ((lat - float(np.mean(lat))) / lat_span)
+        wx = np.clip(wx, -0.92, 0.92)
+        wy = np.clip(wy, -0.92, 0.92)
+    else:
+        well_assets = pd.DataFrame()
+        wx = np.array([])
+        wy = np.array([])
+
+    # Authentic Thar Desert Aeolian Dune Geomorphology
+    # Prevailing Southwest Monsoon wind vector in Rajasthan (azimuth ~42 degrees from SW)
+    theta = 0.733
+    u = xx * np.cos(theta) + yy * np.sin(theta)  # Longitudinal / along-wind axis
+    v = -xx * np.sin(theta) + yy * np.cos(theta) # Transverse / cross-wind axis
+
+    # 1. Longitudinal (Seif) sand dunes running parallel to the wind
+    dune_seif = 0.068 * np.sin(v * 4.9 + 0.32 * np.sin(u * 2.8))
+
+    # 2. Transverse Barchanoid dunes with asymmetric gentle windward slope & steep slip face
+    barchan_u = u * 6.4 - 0.35 * (v ** 2)
+    dune_barchan = 0.052 * (
+        np.sin(barchan_u)
+        + 0.32 * np.sin(2.0 * barchan_u)
+        - 0.12 * np.sin(3.0 * barchan_u)
+    )
+
+    # 3. Interdunal depressions / Khadin clay-silt swales between dune chains
+    interdune_hollow = -0.038 * np.cos(v * 2.2 + u * 1.4)
+
+    # 4. Aeolian saltation wind ripple micro-relief
+    wind_ripples = 0.009 * np.sin(u * 32.0 + 0.25 * np.cos(v * 16.0))
+
+    dune_system = dune_seif + dune_barchan + interdune_hollow + wind_ripples
+
+    # Build Desert Terrain Surface
+    if has_coords and has_elev and len(well_assets) >= 3:
+        elev_vals = well_assets["Elevation"].to_numpy(dtype=float)
+        elev_norm = (elev_vals - float(np.mean(elev_vals))) / (max(float(np.ptp(elev_vals)), 1.0))
+        elev_base = 0.14 + 0.18 * _interpolate_idw_grid(wx, wy, elev_norm, xx, yy)
+        # Layer realistic Thar dunes onto authoritative DEM elevation topography
+        terrain = elev_base + 0.65 * dune_system
+        terrain_hover = (
+            "Thar Desert Geomorphology (Workbook DEM Elevation + Aeolian Dune Systems)<br>"
+            "SW-to-NE Longitudinal Seif & Barchan Dunes with Aeolian Ripples<extra></extra>"
+        )
+    else:
+        terrain = 0.15 + 1.25 * dune_system
+        terrain_hover = (
+            "Thar Desert Landscape (Longitudinal Seif Dunes, Barchans & Interdunal Flats)<extra></extra>"
+        )
+
+    # Apply Vertical Terrain Exaggeration
+    if exaggeration != 1.0:
+        terrain = float(np.mean(terrain)) + float(exaggeration) * (terrain - float(np.mean(terrain)))
+
+    # Select desert lighting and colorscale palette based on chosen ambiance
+    if "Sunset" in ambiance or "Golden Hour" in ambiance:
+        desert_colorscale = [
+            [0.00, "#4a154b"],  # Deep purple-terracotta twilight shadow
+            [0.15, "#7c2d12"],  # Warm burnt sienna
+            [0.35, "#c2410c"],  # Rich amber-orange sand
+            [0.55, "#ea580c"],  # Vibrant sunset-lit slope
+            [0.75, "#f59e0b"],  # Glowing golden dune flank
+            [0.90, "#fde047"],  # Brilliant sunset crest
+            [1.00, "#fffbeb"],  # Sun specular glint
+        ]
+        paper_bg = "rgba(254, 243, 224, 0.98)"
+        light_pos = dict(x=180, y=-120, z=110)
+        sun_color = "#ea580c"
+    elif "Night" in ambiance:
+        desert_colorscale = [
+            [0.00, "#090d16"],  # Deep midnight desert shadow
+            [0.20, "#1e293b"],  # Slate desert gravel
+            [0.45, "#334155"],  # Moonlit sand sheet
+            [0.70, "#475569"],  # Starlit dune slope
+            [0.90, "#64748b"],  # Silver-crested dune ridge
+            [1.00, "#94a3b8"],  # Moonlight reflection
+        ]
+        paper_bg = "#090d16"
+        light_pos = dict(x=60, y=-60, z=200)
+        sun_color = "#38bdf8"
+    else:  # High Noon Thar Sun (Default)
+        desert_colorscale = [
+            [0.00, "#78350f"],  # Deep interdunal silt / ironstone
+            [0.16, "#9a3412"],  # Warm desert terracotta
+            [0.35, "#c27838"],  # Classic Thar golden desert sand
+            [0.55, "#d97706"],  # Windward sunlit sand slope
+            [0.72, "#eab308"],  # Radiant amber crest flank
+            [0.88, "#fde047"],  # Brilliant sun-baked dune crest
+            [1.00, "#fffbeb"],  # Blazing silica quartz specular highlight
+        ]
+        paper_bg = "rgba(255, 251, 245, 0.98)"
+        light_pos = dict(x=130, y=-160, z=190)
+        sun_color = "#f59e0b"
+
+    fig = go.Figure()
+
+    # Handle Geological Cutaway Mode on Surface Terrain
+    surf_opacity = 0.94
+    terrain_surface_data = np.copy(terrain)
+    show_terrain_surface = True
+
+    if cutaway_mode == "Groundwater-Only Visualization":
+        show_terrain_surface = False
+    elif cutaway_mode == "Combined Surface & Subsurface View":
+        show_terrain_surface = True
+        surf_opacity = 0.45  # Translucent glassmorphic sand surface
+    elif cutaway_mode == "Surface + Partially Exposed Underground":
+        show_terrain_surface = True
+        terrain_surface_data = np.where((xx > 0.1) & (yy < -0.1), np.nan, terrain_surface_data)
+    elif cutaway_mode == "Full Geological Cutaway":
+        show_terrain_surface = True
+        terrain_surface_data = np.where(xx > 0.05, np.nan, terrain_surface_data)
+    elif cutaway_mode == "Vertical Geological Cross-Section":
+        show_terrain_surface = True
+        terrain_surface_data = np.where(yy > 0.0, np.nan, terrain_surface_data)
+
+    # 1. Thar Desert Topography Surface Mesh
+    if show_terrain_surface and _has_layer(layers, "Terrain (Thar Sand Dunes)", "Terrain"):
+        fig.add_trace(
+            go.Surface(
+                x=xx,
+                y=yy,
+                z=terrain_surface_data,
+                colorscale=desert_colorscale,
+                showscale=False,
+                opacity=surf_opacity,
+                name="Thar Sand Dunes",
+                hovertemplate=terrain_hover,
+                lighting=dict(
+                    ambient=0.56,
+                    diffuse=0.88,
+                    specular=0.45,
+                    roughness=0.62,
+                    fresnel=0.32,
+                ),
+                lightposition=light_pos,
+                contours=dict(
+                    z=dict(show=False),
+                ),
+            )
+        )
+
+    # 2. Ephemeral Luni Riverbed & Saline Flats (Wadi Geomorphology)
+    if _has_layer(layers, "Luni Ephemeral Riverbed & Saline Flats", "River"):
+        rx = np.linspace(-0.98, 0.98, 120)
+        ry = 0.22 * np.sin(rx * 4.2) - 0.12 * np.cos(rx * 2.5)
+        rz = float(np.mean(terrain)) - 0.02 + 0.015 * np.cos(rx * 3.5)
+        rain_val = float(state.get("rainfall") or 0.0)
+
+        if rain_val < 30.0:
+            # Dry season: sandy-gravel riverbed with Pachpadra-style saline salt efflorescence
+            fig.add_trace(
+                go.Scatter3d(
+                    x=rx,
+                    y=ry,
+                    z=rz,
+                    mode="lines",
+                    line=dict(color="#d4a373", width=7),
+                    name="Luni Dry Wadi Channel",
+                    hovertemplate="Luni River Ephemeral Wadi (Dry Sandy-Gravel Bed)<br>Monsoon recharge conduit / Pachpadra basin<extra></extra>",
+                )
+            )
+            fig.add_trace(
+                go.Scatter3d(
+                    x=rx[::4],
+                    y=ry[::4] + 0.02,
+                    z=rz[::4] + 0.004,
+                    mode="markers",
+                    marker=dict(size=4.5, color="#f8fafc", symbol="circle", opacity=0.85),
+                    name="Saline Salt Crusts (Playas)",
+                    hovertemplate="Saline Salt Efflorescence Crust (Pachpadra / Sambhar Salt Bed)<extra></extra>",
+                )
+            )
+        else:
+            # Monsoon active braided flow
+            fig.add_trace(
+                go.Scatter3d(
+                    x=rx,
+                    y=ry,
+                    z=rz + 0.008,
+                    mode="lines",
+                    line=dict(color="#0284c7", width=9),
+                    name="Luni Active Monsoon Flow",
+                    hovertemplate=f"Luni River Active Flow (Monsoon Recharge: {rain_val:.1f} mm)<extra></extra>",
+                )
+            )
+
+    # 3. Subsurface Stratigraphy & Piezometric Water Table Surface
+    dtwl_now = float(state.get("dtwl") or 15.0)
+    mean_level = float(np.clip(0.04 - (dtwl_now / 180.0), -0.32, 0.04))
+
+    if has_coords and len(well_assets) >= 3:
+        well_dtwls = well_assets[TARGET].to_numpy(dtype=float)
+        obs_mean = float(np.mean(well_dtwls))
+        shifted_dtwls = np.clip(well_dtwls + (dtwl_now - obs_mean), 0.2, 250.0)
+        dtwl_grid = _interpolate_idw_grid(wx, wy, shifted_dtwls, xx, yy)
+        aquifer_z = np.clip(0.04 - (dtwl_grid / 180.0), -0.34, 0.04)
+    else:
+        dtwl_grid = np.full_like(xx, dtwl_now)
+        aquifer_z = np.full_like(xx, mean_level)
+
+    if _has_layer(layers, "Aquifer Water Table", "Aquifer"):
+        # In Simulated mode, display baseline observed water table wireframe
+        if mode == "Simulated" and baseline_dtwl is not None and abs(dtwl_now - baseline_dtwl) > 0.05:
+            base_z = aquifer_z - ((baseline_dtwl - dtwl_now) / 180.0)
+            fig.add_trace(
+                go.Surface(
+                    x=xx,
+                    y=yy,
+                    z=base_z,
+                    colorscale=[[0, "#94a3b8"], [1, "#cbd5e1"]],
+                    opacity=0.28,
+                    showscale=False,
+                    name="Baseline Water Table",
+                    hovertemplate=f"Baseline Observed Water Table ({baseline_dtwl:.2f} mbgl)<extra></extra>",
+                )
+            )
+
+        aq_colors = (
+            [[0.0, "#0369a1"], [0.5, "#0284c7"], [1.0, "#38bdf8"]]
+            if dtwl_now <= stress_thresholds[1]
+            else [[0.0, "#b45309"], [0.5, "#d97706"], [1.0, "#0284c7"]]
+        )
+        fig.add_trace(
+            go.Surface(
+                x=xx,
+                y=yy,
+                z=aquifer_z,
+                customdata=dtwl_grid,
+                colorscale=aq_colors,
+                opacity=0.68,
+                showscale=False,
+                name="Luni-Lathi Aquifer Water Table",
+                hovertemplate="<b>Piezometric Water Table</b><br>Basin Aquifer DTWL: <b>%{customdata:.2f} mbgl</b><extra></extra>",
+                lighting=dict(ambient=0.7, diffuse=0.8, specular=0.6, roughness=0.3),
+            )
+        )
+
+    # Subsurface Geological Stratigraphy Planes of Western Rajasthan
+    if _has_layer(layers, "Subsurface Stratigraphy", "Stratigraphy"):
+        for z_plane, color, label, desc in [
+            (0.05, "#a16207", "Vadose Zone (Calcareous Murrum)", "Calcareous Kankar, Murrum & Unsaturated Aeolian Sand (0–18 mbgl)"),
+            (-0.18, "#475569", "Weathered Sandstone Aquifer", "Fractured Alluvial Sandstone Aquifer Formation (18–60 mbgl)"),
+            (-0.34, "#1e293b", "Deep Crystalline Basement", "Malani Rhyolite & Jodhpur Sandstone Basement (> 65 mbgl)"),
+        ]:
+            fig.add_trace(
+                go.Surface(
+                    x=xx,
+                    y=yy,
+                    z=np.full_like(xx, z_plane),
+                    colorscale=[[0, color], [1, color]],
+                    opacity=0.18,
+                    showscale=False,
+                    name=label,
+                    hovertemplate=f"<b>{label}</b><br>{desc}<extra></extra>",
+                )
+            )
+
+    # 4. Interactive Monitoring Well Assets & 3D Borehole Columns
+    selected_target_xyz: tuple[float, float, float] | None = None
+    if _has_layer(layers, "Wells (Piezometer Telemetry Stations)", "Wells") and has_coords and not well_assets.empty:
+        safe_t, semi_t, crit_t = stress_thresholds
+        obs_mean = float(well_assets[TARGET].mean())
+        well_dtwl_active = np.clip(well_assets[TARGET].to_numpy(dtype=float) + (dtwl_now - obs_mean), 0.2, 250.0)
+
+        # Surface elevation and water-table depth at each wellhead
+        if has_elev and len(well_assets) >= 3:
+            elev_vals = well_assets["Elevation"].to_numpy(dtype=float)
+            elev_norm = (elev_vals - float(np.mean(elev_vals))) / (max(float(np.ptp(elev_vals)), 1.0))
+            wz_surf = 0.14 + 0.18 * elev_norm + 0.02
+        else:
+            wz_surf = 0.15 + 0.04 * np.sin(wx * 4.0) + 0.02
+
+        wz_water = np.clip(0.04 - (well_dtwl_active / 180.0), -0.34, 0.04)
+
+        # Vertical borehole shafts from sand dune surface to water table
+        if _has_layer(layers, "Borehole Columns", "Borehole columns", "Boreholes"):
+            bx: list[float | None] = []
+            by: list[float | None] = []
+            bz: list[float | None] = []
+            for i in range(len(well_assets)):
+                bx.extend([float(wx[i]), float(wx[i]), None])
+                by.extend([float(wy[i]), float(wy[i]), None])
+                bz.extend([float(wz_surf[i]), float(wz_water[i]), None])
+            fig.add_trace(
+                go.Scatter3d(
+                    x=bx,
+                    y=by,
+                    z=bz,
+                    mode="lines",
+                    line=dict(color="#0284c7", width=3.5),
+                    opacity=0.60,
+                    name="Piezometer Borehole Columns",
+                    hoverinfo="skip",
+                )
+            )
+
+        colors: list[str] = []
+        sizes: list[int] = []
+        hover_texts: list[str] = []
+        v_names = well_assets["VILLAGE"].astype(str).tolist()
+        for i, v_name in enumerate(v_names):
+            v_dtwl = float(well_dtwl_active[i])
+            st_info = classify_water_stress(v_dtwl, safe_t, semi_t, crit_t)
+            is_sel = v_name == selected_village
+            colors.append("#2563eb" if is_sel else st_info["color"])
+            sizes.append(11 if is_sel else 7)
+            if is_sel:
+                selected_target_xyz = (float(wx[i]), float(wy[i]), float(wz_surf[i]))
+            lat_i = float(well_assets["LATITUDE"].iloc[i])
+            lon_i = float(well_assets["LONGITUDE"].iloc[i])
+            elev_str = (
+                f"<br>Elevation: <b>{float(well_assets['Elevation'].iloc[i]):.1f} m ASL</b>"
+                if "Elevation" in well_assets.columns and pd.notna(well_assets["Elevation"].iloc[i])
+                else ""
+            )
+            hover_texts.append(
+                f"<b>Piezometer Station: {v_name}</b>"
+                f"<br>USD Path: /World/RajasthanBasin/MonitoringNetwork/Well_{v_name.replace(' ', '_')}"
+                f"<br>Coordinates: {lat_i:.4f}°N, {lon_i:.4f}°E{elev_str}"
+                f"<br>Active DTWL ({mode}): <b>{v_dtwl:.2f} mbgl</b>"
+                f"<br>Hydrological Stress: <b>{st_info['category']}</b>"
+                f"<br>Telemetry: <i>Solar PV + Pressure Transducer Active</i>"
+            )
+
+        fig.add_trace(
+            go.Scatter3d(
+                x=wx,
+                y=wy,
+                z=wz_surf,
+                mode="markers",
+                marker=dict(
+                    size=sizes,
+                    color=colors,
+                    symbol="diamond",
+                    line=dict(color="#0f172a", width=1.8),
+                ),
+                name="Telemetry Piezometers (Stress-Coded)",
+                text=hover_texts,
+                hovertemplate="%{text}<extra></extra>",
+            )
+        )
+
+        # Highlight selected well with 3D focus beacon
+        if selected_target_xyz is not None:
+            sx, sy, sz = selected_target_xyz
+            fig.add_trace(
+                go.Scatter3d(
+                    x=[sx, sx],
+                    y=[sy, sy],
+                    z=[sz - 0.36, sz + 0.24],
+                    mode="lines+markers+text",
+                    line=dict(color="#1d4ed8", width=6),
+                    marker=dict(size=[8, 14], color="#1d4ed8", symbol=["circle", "diamond-open"]),
+                    text=["", f"🎯 {selected_village}"],
+                    textposition="top center",
+                    textfont=dict(color="#0f172a", size=12.5, family="Inter, sans-serif"),
+                    name=f"Selected: {selected_village}",
+                    hovertemplate=f"<b>Selected Asset: {selected_village}</b><extra></extra>",
+                )
+            )
+
+    # 5. Authentic Thar Desert Xerophytic Flora (Khejri Trees & Sewan Grass)
+    if _has_layer(layers, "Desert Flora (Khejri Trees & Sewan Grass)", "Vegetation"):
+        # Khejri trees cluster in interdunal swales where groundwater is reachable
+        khejri_mask = (interdune_hollow < -0.015) & (np.abs(xx) < 0.85) & (np.abs(yy) < 0.85)
+        kx_pts = xx[khejri_mask][::20]
+        ky_pts = yy[khejri_mask][::20]
+        kz_pts = terrain[khejri_mask][::20]
+
+        if len(kx_pts) > 0:
+            # Khejri Umbrella Canopies
+            fig.add_trace(
+                go.Scatter3d(
+                    x=kx_pts,
+                    y=ky_pts,
+                    z=kz_pts + 0.045,
+                    mode="markers",
+                    marker=dict(size=7.5, color="#3f6212", symbol="circle", opacity=0.92),
+                    name="🌳 Khejri Trees (Prosopis cineraria)",
+                    hovertemplate="<b>Khejri Tree (Prosopis cineraria)</b><br>State Tree of Rajasthan (Deep 35m Taproots)<extra></extra>",
+                )
+            )
+            # Khejri Desert Trunks
+            fig.add_trace(
+                go.Scatter3d(
+                    x=kx_pts,
+                    y=ky_pts,
+                    z=kz_pts + 0.015,
+                    mode="markers",
+                    marker=dict(size=3.5, color="#78350f", symbol="square", opacity=0.85),
+                    name="Khejri Trunks",
+                    hoverinfo="skip",
+                )
+            )
+
+        # Sewan dry tussock grass tufts along dune swales
+        grass_mask = (terrain > 0.12) & (terrain < 0.19)
+        gx_pts = xx[grass_mask][::26]
+        gy_pts = yy[grass_mask][::26]
+        gz_pts = terrain[grass_mask][::26]
+        if len(gx_pts) > 0:
+            fig.add_trace(
+                go.Scatter3d(
+                    x=gx_pts,
+                    y=gy_pts,
+                    z=gz_pts + 0.008,
+                    mode="markers",
+                    marker=dict(size=2.8, color="#ca8a04", symbol="diamond", opacity=0.75),
+                    name="🌾 Sewan Grass (Lasiurus scindicus)",
+                    hovertemplate="<b>Sewan Grass (Lasiurus scindicus)</b><br>Dune-stabilizing desert perennial grass<extra></extra>",
+                )
+            )
+
+    # 6. Traditional Thar Desert Rainwater Harvesting Structures (Khadin & Tanka)
+    if _has_layer(layers, "Traditional Thar Water Harvesting (Khadins)", "Water harvesting"):
+        khadin_x = [-0.45, 0.35, -0.15]
+        khadin_y = [0.38, -0.42, -0.65]
+        khadin_z = [float(np.mean(terrain)) + 0.01] * 3
+        fig.add_trace(
+            go.Scatter3d(
+                x=khadin_x,
+                y=khadin_y,
+                z=khadin_z,
+                mode="markers+text",
+                marker=dict(size=9, color="#0284c7", symbol="circle-open", line=dict(color="#78716c", width=3)),
+                text=["🏺 Khadin Catchment", "🏺 Tanka Cistern", "🏺 Kund System"],
+                textposition="top center",
+                textfont=dict(size=10, color="#78350f"),
+                name="🏺 Traditional Thar Water Harvesting",
+                hovertemplate="<b>Indigenous Thar Water Harvesting Structure</b><br>Khadin / Tanka desert runoff catchment<extra></extra>",
+            )
+        )
+
+    # 7. Atmospheric Forcing: Rainfall & Evapotranspiration
+    if _has_layer(layers, "Rainfall Flux", "Rainfall") and state.get("rainfall") is not None and (state["rainfall"] or 0) > 0:
+        count = int(np.clip((state["rainfall"] or 0) * 1.8, 12, 180))
+        rain_x = np.linspace(-0.95, 0.95, count)
+        rain_y = np.sin(np.arange(count) * 2.7) * 0.9
+        rain_z = 0.45 + (np.arange(count) % 7) * 0.045
+        fig.add_trace(
+            go.Scatter3d(
+                x=rain_x,
+                y=rain_y,
+                z=rain_z,
+                mode="markers",
+                marker=dict(size=2.5, color="#0284c7", opacity=0.75),
+                name="Rainfall Flux",
+                hovertemplate=f"Rainfall Forcing: {state['rainfall']:.1f} mm<extra></extra>",
+            )
+        )
+
+    if _has_layer(layers, "ET Flux", "ET") and state.get("et") is not None and (state["et"] or 0) > 0:
+        count = int(np.clip((state["et"] or 0) * 6.0, 8, 90))
+        et_x = np.linspace(-0.75, 0.75, count)
+        et_y = np.cos(np.arange(count) * 1.9) * 0.55
+        et_z = 0.10 + (np.arange(count) % 9) * 0.042
+        fig.add_trace(
+            go.Scatter3d(
+                x=et_x,
+                y=et_y,
+                z=et_z,
+                mode="markers",
+                marker=dict(size=2.5, color="#f59e0b", opacity=0.80),
+                name="ET Flux",
+                hovertemplate=f"Evapotranspiration Flux: {state['et']:.1f} mm<extra></extra>",
+            )
+        )
+
+    # 8. Subsurface Groundwater Flow Streamlines
+    if _has_layer(layers, "Groundwater Flow Streamlines", "Groundwater flow") and state.get("dtwl") is not None:
+        for offset in (-0.42, 0.0, 0.42):
+            flow_x = np.linspace(-0.85, 0.85, 30)
+            flow_y = np.full_like(flow_x, offset)
+            flow_z = mean_level - 0.04 + 0.02 * np.sin(flow_x * 7.0)
+            fig.add_trace(
+                go.Scatter3d(
+                    x=flow_x,
+                    y=flow_y,
+                    z=flow_z,
+                    mode="lines",
+                    line=dict(color="#06b6d4", width=4),
+                    name="Subsurface Hydraulic Streamlines",
+                    showlegend=(offset == -0.42),
+                    hovertemplate="Subsurface Hydraulic Gradient Streamline<extra></extra>",
+                )
+            )
+
+    # 9. Desert Sun Marker in Sky (Atmospheric Solar Driver)
+    if "Night" not in ambiance:
+        fig.add_trace(
+            go.Scatter3d(
+                x=[0.85],
+                y=[-0.95],
+                z=[0.65],
+                mode="markers+text",
+                marker=dict(size=14, color=sun_color, symbol="circle", line=dict(color="#fde047", width=3)),
+                text=["☀️ Thar Sun"],
+                textposition="top center",
+                textfont=dict(size=11, color="#b45309"),
+                name="☀️ Desert Solar Forcing",
+                hovertemplate="<b>Direct Solar Irradiance (Thar Desert)</b><br>Atmospheric driver of intense potential evapotranspiration<extra></extra>",
+            )
+        )
+
+    # Camera configuration supporting all 10 presets with Elevated Isometric View as default
+    camera_map = {
+        "📐 Elevated Isometric View (Default)": dict(eye=dict(x=1.65, y=-1.65, z=1.15), center=dict(x=0, y=0, z=-0.05)),
+        "Isometric Cutaway": dict(eye=dict(x=1.65, y=-1.65, z=1.15), center=dict(x=0, y=0, z=-0.05)),
+        "📐 Isometric Cutaway (Hydro Block)": dict(eye=dict(x=1.65, y=-1.65, z=1.15), center=dict(x=0, y=0, z=-0.05)),
+        "🌐 Basin Overview": dict(eye=dict(x=1.95, y=-1.95, z=1.55), center=dict(x=0, y=0, z=-0.10)),
+        "🛰️ Top-Down GIS View": dict(eye=dict(x=0.0, y=-0.001, z=2.45), center=dict(x=0, y=0, z=0)),
+        "Top-Down Spatial Plan": dict(eye=dict(x=0.0, y=-0.001, z=2.45), center=dict(x=0, y=0, z=0)),
+        "🛰️ Top-Down Spatial Plan": dict(eye=dict(x=0.0, y=-0.001, z=2.45), center=dict(x=0, y=0, z=0)),
+        "🌄 Low Oblique Landscape View": dict(eye=dict(x=1.85, y=-1.85, z=0.48), center=dict(x=0, y=0, z=-0.05)),
+        "🏜️ Desert Dune Vista (Horizon View)": dict(eye=dict(x=1.85, y=-1.85, z=0.48), center=dict(x=0, y=0, z=-0.05)),
+        "🪓 Groundwater Cutaway View": dict(eye=dict(x=1.45, y=-1.45, z=0.65), center=dict(x=0, y=0, z=-0.15)),
+        "🔬 Geological Cross-Section View": dict(eye=dict(x=0.02, y=-2.25, z=0.08), center=dict(x=0, y=0, z=-0.10)),
+        "Subsurface Cross-Section": dict(eye=dict(x=0.02, y=-2.25, z=0.08), center=dict(x=0, y=0, z=-0.10)),
+        "🔬 Subsurface Cross-Section": dict(eye=dict(x=0.02, y=-2.25, z=0.08), center=dict(x=0, y=0, z=-0.10)),
+        "🎯 Monitoring Well Focus": dict(eye=dict(x=1.2, y=-1.2, z=0.8), center=dict(x=0, y=0, z=0)),
+        "Focus Selected Asset": dict(eye=dict(x=1.2, y=-1.2, z=0.8), center=dict(x=0, y=0, z=0)),
+        "🎯 Focus Selected Asset": dict(eye=dict(x=1.2, y=-1.2, z=0.8), center=dict(x=0, y=0, z=0)),
+        "🔄 Free Orbit View": dict(eye=dict(x=1.70, y=-1.70, z=1.10), center=dict(x=0, y=0, z=0)),
+        "⏮ Reset Camera": dict(eye=dict(x=1.65, y=-1.65, z=1.15), center=dict(x=0, y=0, z=-0.05)),
+        "📐 Fit to Terrain": dict(eye=dict(x=1.50, y=-1.50, z=1.05), center=dict(x=0, y=0, z=0)),
+    }
+    if camera_preset in ("🎯 Monitoring Well Focus", "Focus Selected Asset", "🎯 Focus Selected Asset") and selected_target_xyz is not None:
+        sx, sy, sz = selected_target_xyz
+        cam_cfg = dict(
+            eye=dict(x=sx + 0.65, y=sy - 0.65, z=sz + 0.45),
+            center=dict(x=sx * 0.4, y=sy * 0.4, z=sz * 0.3),
+        )
+    else:
+        cam_cfg = camera_map.get(camera_preset, camera_map["📐 Elevated Isometric View (Default)"])
+
+    fig.update_layout(
+        meta={"digital_twin": True},
+        paper_bgcolor=paper_bg,
+        plot_bgcolor=paper_bg,
+        height=620,
+        margin=dict(l=0, r=0, t=28, b=0),
+        font=dict(color="#1E293B", family="Inter, sans-serif", size=12.5),
+        legend=dict(
+            bgcolor="rgba(255,255,255,0.85)",
+            orientation="h",
+            y=1.03,
+            font=dict(color="#1E293B", size=11.5),
+        ),
+        hoverlabel=dict(
+            bgcolor="#FFFFFF",
+            bordercolor="#0F172A",
+            font=dict(color="#0F172A", family="Inter, sans-serif", size=12.5),
+        ),
+        scene=dict(
+            bgcolor=paper_bg,
+            aspectmode="cube",
+            camera=cam_cfg,
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            zaxis=dict(visible=False),
+        ),
+    )
+    return fig
+
+
+def _get_threejs_regional_template() -> str:
+    """Return the raw Three.js 50 km Regional Environmental & Hydrological Digital Twin HTML/JS template."""
+    return r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Naya Pani - 50 km Regional Hydrological Digital Twin</title>
+  <style>
+    * { box-sizing: border-box; }
+    body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #070b14; color: #f8fafc; }
+    #desert-canvas-wrap { position: relative; width: 100%; height: 760px; border-radius: 12px; overflow: hidden; background: #0c0804; box-shadow: 0 12px 40px rgba(0,0,0,0.55); user-select: none; }
+    #three-canvas { width: 100%; height: 100%; display: block; }
+
+    /* Top 10-Preset Camera Toolbar */
+    .top-toolbar { position: absolute; top: 10px; left: 12px; right: 12px; display: flex; align-items: center; justify-content: space-between; gap: 8px; z-index: 20; pointer-events: none; }
+    .preset-bar { display: flex; align-items: center; gap: 4px; background: rgba(15, 23, 42, 0.90); backdrop-filter: blur(12px); padding: 5px 8px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.15); pointer-events: auto; overflow-x: auto; max-width: calc(100% - 290px); scrollbar-width: none; }
+    .preset-bar::-webkit-scrollbar { display: none; }
+    .preset-btn { background: transparent; border: 1px solid transparent; color: #cbd5e1; padding: 5px 8px; border-radius: 6px; font-size: 11px; font-weight: 500; cursor: pointer; white-space: nowrap; transition: all 0.2s ease; display: flex; align-items: center; gap: 4px; }
+    .preset-btn:hover { background: rgba(255,255,255,0.1); color: #fff; border-color: rgba(255,255,255,0.25); }
+    .preset-btn.active { background: #d97706; color: #fff; border-color: #f59e0b; font-weight: 600; box-shadow: 0 2px 10px rgba(217,119,6,0.4); }
+
+    .top-actions { display: flex; align-items: center; gap: 5px; pointer-events: auto; }
+    .action-btn { background: rgba(15, 23, 42, 0.90); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.15); color: #cbd5e1; padding: 5px 9px; border-radius: 6px; font-size: 11px; font-weight: 500; cursor: pointer; transition: all 0.2s ease; display: flex; align-items: center; gap: 4px; }
+    .action-btn:hover { background: #334155; color: #fff; }
+    .action-btn.active { background: #d97706; color: #fff; border-color: #f59e0b; }
+
+    /* Left Collapsible Layer Drawer */
+    .layer-drawer-btn { position: absolute; top: 54px; left: 12px; z-index: 15; background: rgba(15, 23, 42, 0.90); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.18); color: #f8fafc; padding: 6px 11px; border-radius: 6px; font-size: 11.5px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 6px; box-shadow: 0 4px 14px rgba(0,0,0,0.3); }
+    .layer-drawer-btn:hover { background: #1e293b; }
+    .layer-panel { position: absolute; top: 88px; left: 12px; width: 240px; background: rgba(15, 23, 42, 0.94); backdrop-filter: blur(14px); border: 1px solid rgba(255,255,255,0.18); border-radius: 10px; padding: 10px 12px; z-index: 15; display: none; box-shadow: 0 10px 28px rgba(0,0,0,0.6); max-height: 580px; overflow-y: auto; }
+    .layer-panel.open { display: block; }
+    .layer-panel-title { font-size: 11px; font-weight: 700; color: #f59e0b; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,0.12); padding-bottom: 4px; display: flex; align-items: center; justify-content: space-between; }
+    .layer-item { display: flex; align-items: center; justify-content: space-between; font-size: 11px; color: #e2e8f0; margin-bottom: 5px; cursor: pointer; padding: 2px 0; }
+    .layer-item input { accent-color: #f59e0b; cursor: pointer; }
+
+    /* Right Floating Inspector Panel */
+    .inspector-panel { position: absolute; top: 54px; right: 12px; width: 285px; background: rgba(15, 23, 42, 0.94); backdrop-filter: blur(14px); border: 1px solid rgba(255,255,255,0.18); border-radius: 10px; padding: 12px 14px; z-index: 15; box-shadow: 0 10px 28px rgba(0,0,0,0.6); }
+    .ins-header { font-size: 10.5px; font-weight: 700; color: #f59e0b; text-transform: uppercase; letter-spacing: 0.6px; display: flex; align-items: center; justify-content: space-between; }
+    .ins-village { font-size: 14px; font-weight: 700; color: #fff; margin-top: 3px; }
+    .ins-row { display: flex; justify-content: space-between; font-size: 11px; color: #94a3b8; margin-top: 4px; }
+    .ins-val { color: #f1f5f9; font-weight: 600; }
+    .ins-badge { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 10.5px; font-weight: 600; color: #fff; }
+    .ins-focus-btn { width: 100%; margin-top: 9px; background: #0284c7; border: none; color: #fff; padding: 6px; border-radius: 6px; font-size: 11px; font-weight: 600; cursor: pointer; transition: background 0.2s ease; }
+    .ins-focus-btn:hover { background: #0369a1; }
+
+    /* Bottom Scientific Control Dock */
+    .bottom-dock { position: absolute; bottom: 10px; left: 12px; right: 12px; display: flex; align-items: center; justify-content: space-between; gap: 8px; z-index: 20; pointer-events: none; }
+    .dock-left { display: flex; align-items: center; gap: 10px; pointer-events: auto; background: rgba(15, 23, 42, 0.90); backdrop-filter: blur(12px); padding: 6px 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.16); }
+    .dock-center { display: flex; align-items: center; gap: 12px; pointer-events: auto; background: rgba(15, 23, 42, 0.94); backdrop-filter: blur(14px); padding: 6px 16px; border-radius: 30px; border: 1px solid rgba(255,255,255,0.22); box-shadow: 0 6px 24px rgba(0,0,0,0.45); }
+    .dock-right { display: flex; align-items: center; gap: 8px; pointer-events: auto; background: rgba(15, 23, 42, 0.90); backdrop-filter: blur(12px); padding: 6px 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.16); font-size: 11px; color: #cbd5e1; }
+
+    .dock-ctrl { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #e2e8f0; }
+    .dock-ctrl label { font-weight: 600; color: #fde047; white-space: nowrap; }
+    .dock-ctrl select { background: #1e293b; border: 1px solid #475569; color: #f8fafc; font-size: 11px; border-radius: 4px; padding: 2px 5px; outline: none; cursor: pointer; }
+    .dock-ctrl input[type=range] { width: 95px; accent-color: #f59e0b; cursor: pointer; }
+    .dock-val { font-weight: 700; color: #38bdf8; min-width: 26px; text-align: right; }
+
+    /* Compass & Scale Bar */
+    .compass-wrap { display: flex; align-items: center; gap: 6px; }
+    .compass-rose { width: 22px; height: 22px; transition: transform 0.1s linear; }
+    .scale-bar { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+    .scale-line { width: 55px; height: 3px; background: #cbd5e1; border-left: 2px solid #fff; border-right: 2px solid #fff; }
+    .scale-txt { font-size: 9px; color: #94a3b8; font-family: monospace; }
+
+    /* Hover Tooltip */
+    #well-tooltip { position: absolute; display: none; background: rgba(15,23,42,0.94); border: 1px solid #f59e0b; color: #fff; font-size: 11px; padding: 5px 9px; border-radius: 5px; pointer-events: none; z-index: 30; white-space: nowrap; box-shadow: 0 6px 18px rgba(0,0,0,0.5); }
+    #loading-indicator { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #f59e0b; font-size: 14px; font-weight: 600; z-index: 5; text-align: center; }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+  <div id="desert-canvas-wrap">
+    <div id="loading-indicator">🏜️ Initializing 50 km Regional Environmental Digital Twin (Three.js Engine)…</div>
+    <canvas id="three-canvas"></canvas>
+    <div id="well-tooltip"></div>
+
+    <!-- Top 10-Preset Toolbar -->
+    <div class="top-toolbar">
+      <div class="preset-bar">
+        <button class="preset-btn active" id="btn-iso" onclick="applyCameraPreset('iso')">📐 Elevated Isometric</button>
+        <button class="preset-btn" id="btn-basin" onclick="applyCameraPreset('basin')">🌐 50 km Basin</button>
+        <button class="preset-btn" id="btn-top" onclick="applyCameraPreset('top')">🛰️ Top-Down GIS</button>
+        <button class="preset-btn" id="btn-oblique" onclick="applyCameraPreset('oblique')">🌄 Low Oblique</button>
+        <button class="preset-btn" id="btn-cutaway" onclick="applyCameraPreset('cutaway')">🪓 Subsurface Cutaway</button>
+        <button class="preset-btn" id="btn-section" onclick="applyCameraPreset('section')">🔬 Cross-Section</button>
+        <button class="preset-btn" id="btn-well" onclick="applyCameraPreset('well')">🎯 Wellhead</button>
+        <button class="preset-btn" id="btn-village" onclick="applyCameraPreset('village')">🏘️ Settlements</button>
+        <button class="preset-btn" id="btn-river" onclick="applyCameraPreset('river')">🌊 Luni River Corridor</button>
+        <button class="preset-btn" id="btn-fit" onclick="applyCameraPreset('fit')">📐 Fit 50 km</button>
+      </div>
+
+      <div class="top-actions">
+        <button class="action-btn active" id="amb-day" onclick="setAmbiance('day')">☀️ Day</button>
+        <button class="action-btn" id="amb-sunset" onclick="setAmbiance('sunset')">🌅 Sunset</button>
+        <button class="action-btn" id="amb-night" onclick="setAmbiance('night')">🌌 Night</button>
+        <button class="action-btn" id="amb-storm" onclick="setAmbiance('storm')">⛈️ Monsoon</button>
+        <button class="action-btn" onclick="toggleFullscreen()">⛶</button>
+      </div>
+    </div>
+
+    <!-- Left Collapsible Layer Drawer -->
+    <button class="layer-drawer-btn" onclick="toggleLayerDrawer()">⚙️ Scene Layers</button>
+    <div class="layer-panel" id="layer-panel">
+      <div class="layer-panel-title"><span>50 km Regional Layers</span><span style="font-size:10px; color:#94a3b8;">10 Active</span></div>
+      <label class="layer-item"><span>Regional Topography & Dunes</span><input type="checkbox" id="chk-terrain" checked onchange="updateLayers()"></label>
+      <label class="layer-item"><span>Subsurface Stratigraphy (6 Strata)</span><input type="checkbox" id="chk-strata" checked onchange="updateLayers()"></label>
+      <label class="layer-item"><span>Luni Aquifer Water Table</span><input type="checkbox" id="chk-water" checked onchange="updateLayers()"></label>
+      <label class="layer-item"><span>Groundwater Darcy Flow Particles</span><input type="checkbox" id="chk-flow" checked onchange="updateLayers()"></label>
+      <label class="layer-item"><span>Luni River Network & Bridge</span><input type="checkbox" id="chk-river" checked onchange="updateLayers()"></label>
+      <label class="layer-item"><span>WGS84 Monitoring Wells</span><input type="checkbox" id="chk-wells" checked onchange="updateLayers()"></label>
+      <label class="layer-item"><span>Villages, Stepwells & Roads</span><input type="checkbox" id="chk-settlements" checked onchange="updateLayers()"></label>
+      <label class="layer-item"><span>Agricultural Mosaic & Solar Pumps</span><input type="checkbox" id="chk-farms" checked onchange="updateLayers()"></label>
+      <label class="layer-item"><span>Khejri, Rohida & Sewan Flora</span><input type="checkbox" id="chk-flora" checked onchange="updateLayers()"></label>
+      <label class="layer-item"><span>Atmosphere, Clouds & Rain Flux</span><input type="checkbox" id="chk-weather" checked onchange="updateLayers()"></label>
+    </div>
+
+    <!-- Right Floating Inspector Panel -->
+    <div class="inspector-panel" id="inspector-panel">
+      <div class="ins-header">
+        <span>Hydrogeological Asset</span>
+        <span class="ins-badge" id="ins-badge" style="background: __STRESS_COLOR__;">__STRESS_CAT__</span>
+      </div>
+      <div class="ins-village" id="ins-village">__WELL_NAME__</div>
+      <div class="ins-row"><span>District / Block:</span><span class="ins-val" id="ins-geo">__DISTRICT__ (__BLOCK__)</span></div>
+      <div class="ins-row"><span>WGS84 Coordinates:</span><span class="ins-val" id="ins-coords">__WELL_LAT__°N, __WELL_LON__°E</span></div>
+      <div class="ins-row"><span>Surface Elevation:</span><span class="ins-val" id="ins-elev">__WELL_ELEV__ m ASL</span></div>
+      <div class="ins-row"><span>Active DTWL (__MODE__):</span><span class="ins-val" id="ins-dtwl" style="color:#38bdf8; font-size:12px;">__DTWL_VAL__ mbgl</span></div>
+      <div class="ins-row"><span>Water Table Elevation:</span><span class="ins-val" id="ins-wtelev">__WT_ELEV__ m ASL</span></div>
+      <div class="ins-row"><span>Long-Term Trend:</span><span class="ins-val" id="ins-trend">0.00 mbgl/yr</span></div>
+      <button class="ins-focus-btn" onclick="focusSelectedWell()">🎯 Focus Camera on Wellhead</button>
+    </div>
+
+    <!-- Bottom Scientific Control Dock -->
+    <div class="bottom-dock">
+      <div class="dock-left">
+        <div class="compass-wrap">
+          <svg class="compass-rose" id="compass-rose" viewBox="0 0 100 100">
+            <circle cx="50" cy="50" r="45" fill="none" stroke="#64748b" stroke-width="3"/>
+            <polygon points="50,12 60,50 50,42" fill="#ef4444"/>
+            <polygon points="50,12 40,50 50,42" fill="#dc2626"/>
+            <polygon points="50,88 60,50 50,58" fill="#94a3b8"/>
+            <polygon points="50,88 40,50 50,58" fill="#64748b"/>
+            <text x="50" y="24" font-size="11" font-weight="bold" fill="#fff" text-anchor="middle">N</text>
+          </svg>
+          <div class="scale-bar">
+            <div class="scale-line"></div>
+            <div class="scale-txt" id="scale-txt">10 km</div>
+          </div>
+        </div>
+        <div id="mouse-coords" style="font-family:monospace; font-size:10.5px; color:#cbd5e1;">📍 __WELL_LAT__°N, __WELL_LON__°E | Elev: __WELL_ELEV__m</div>
+      </div>
+
+      <div class="dock-center">
+        <div class="dock-ctrl">
+          <label>🪓 Cutaway:</label>
+          <select id="cutaway-select" onchange="applyCutawayMode(this.value)">
+            <option value="complete">Complete Surface Landscape</option>
+            <option value="partial">Surface + Partial Cutaway</option>
+            <option value="full">Full Geological Cutaway</option>
+            <option value="cross">Vertical Cross-Section</option>
+            <option value="groundwater">Groundwater-Only View</option>
+            <option value="combined">Combined Semi-Transparent</option>
+          </select>
+        </div>
+        <div class="dock-ctrl">
+          <label>Slicer:</label>
+          <input type="range" id="slice-slider" min="0" max="100" value="0" oninput="onSliceInput(this.value)">
+          <span class="dock-val" id="slice-val">0%</span>
+        </div>
+        <div class="dock-ctrl">
+          <label>⛰️ Relief:</label>
+          <input type="range" id="exaggeration-slider" min="1.0" max="3.5" step="0.25" value="__EXAGGERATION__" oninput="onExaggerationInput(this.value)">
+          <span class="dock-val" id="exaggeration-val">__EXAGGERATION__x</span>
+        </div>
+      </div>
+
+      <div class="dock-right">
+        <span>50 km Extent: <b>Luni Ephemeral Basin (~7,854 km²)</b></span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const CFG = __CONFIG_JSON__;
+    const wrap = document.getElementById('desert-canvas-wrap');
+    const canvas = document.getElementById('three-canvas');
+    const loader = document.getElementById('loading-indicator');
+    const tooltip = document.getElementById('well-tooltip');
+
+    if (typeof THREE === 'undefined') {
+      loader.innerHTML = '<span style="color:#ef4444;">WebGL / Three.js library loading... Please check connection or use Plotly tab.</span>';
+    } else {
+      initDesertScene();
+    }
+
+    let scene, camera, renderer, controls;
+    let terrainMesh, terrainGeom, baseHeights = [];
+    let waterMesh, vadoseMesh, fracturedMesh, aquitardMesh, bedrockMesh;
+    let clipPlaneX;
+    let dustParticles, rainParticles, flowParticles, cloudGroup, wildlifeGroup;
+    let wellGroup, floraGroup, riverGroup, settlementGroup, farmGroup, roadGroup;
+    let raycaster, mouse;
+    let activeSelectedWell = CFG.selectedVillage;
+    let selectedWellCoords = { x: 0, y: 0, z: 0 };
+
+    // Camera Animation State
+    let isAnimatingCamera = false;
+    let camStartPos = new THREE.Vector3(), camEndPos = new THREE.Vector3();
+    let camStartTarget = new THREE.Vector3(), camEndTarget = new THREE.Vector3();
+    let animStartTime = 0, animDuration = 1200;
+
+    // Lighting & Atmosphere
+    let dirLight, hemiLight, ambLight, sunSphere;
+    let currentAmbiance = 'day';
+
+    function initDesertScene() {
+      loader.style.display = 'none';
+      const w = wrap.clientWidth || 800;
+      const h = wrap.clientHeight || 760;
+
+      // 1. Scene & Elevated Isometric Camera Setup (50 km scope)
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xfef3c7);
+      scene.fog = new THREE.FogExp2(0xfef3c7, 0.0055);
+
+      camera = new THREE.PerspectiveCamera(40, w / h, 0.5, 600);
+      // Default Elevated Isometric View (~35 deg pitch downward, 45 deg azimuth, framing entire 150-unit 50km extent)
+      camera.position.set(68, 52, 68);
+
+      // 2. WebGL Renderer with Soft Shadow Mapping & Local Clipping
+      renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, alpha: false, powerPreference: "high-performance" });
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      renderer.localClippingEnabled = true;
+
+      // 3. OrbitControls
+      controls = new THREE.OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.08;
+      controls.maxPolarAngle = Math.PI / 2 - 0.02;
+      controls.minDistance = 8;
+      controls.maxDistance = 280;
+      controls.target.set(0, 0, 0);
+
+      // 4. Photorealistic Solar Lighting System
+      hemiLight = new THREE.HemisphereLight(0xffedd5, 0x78350f, 0.70);
+      scene.add(hemiLight);
+
+      ambLight = new THREE.AmbientLight(0xffedd5, 0.25);
+      scene.add(ambLight);
+
+      dirLight = new THREE.DirectionalLight(0xfffbeb, 1.45);
+      dirLight.position.set(70, 95, 55);
+      dirLight.castShadow = true;
+      dirLight.shadow.mapSize.width = 2048;
+      dirLight.shadow.mapSize.height = 2048;
+      dirLight.shadow.camera.near = 10;
+      dirLight.shadow.camera.far = 320;
+      dirLight.shadow.camera.left = -90;
+      dirLight.shadow.camera.right = 90;
+      dirLight.shadow.camera.top = 90;
+      dirLight.shadow.camera.bottom = -90;
+      dirLight.shadow.bias = -0.0004;
+      scene.add(dirLight);
+
+      // Sun Visible Disc
+      const sunGeom = new THREE.SphereGeometry(4.5, 16, 16);
+      const sunMat = new THREE.MeshBasicMaterial({ color: 0xfffbeb });
+      sunSphere = new THREE.Mesh(sunGeom, sunMat);
+      sunSphere.position.copy(dirLight.position);
+      scene.add(sunSphere);
+
+      // 5. Geological Cutaway Slicer Plane (Horizontal Extent: -75 to +75)
+      clipPlaneX = new THREE.Plane(new THREE.Vector3(1, 0, 0), 90.0);
+
+      // 6. Regional 50 km Continuous Terrain Mesh (150 x 150 units, 150x150 segments = 22,801 vertices)
+      buildRegional50kmTerrain();
+
+      // 7. Subsurface 3D Geological Stratigraphy (6 Solid Strata Blocks)
+      const waterY = Math.max(-6.5, 1.0 - (CFG.dtwl / 18.0));
+      buildSubsurfaceStratigraphy(waterY);
+
+      // 8. Dynamic Luni River Network, Tributaries & Highway Bridge
+      riverGroup = new THREE.Group();
+      scene.add(riverGroup);
+      buildLuniRiverNetwork();
+
+      // 9. Populated Human Settlements, Architecture & Roadways
+      settlementGroup = new THREE.Group();
+      scene.add(settlementGroup);
+      roadGroup = new THREE.Group();
+      scene.add(roadGroup);
+      buildSettlementsAndRoads();
+
+      // 10. Agricultural Land Mosaic, Tube-Well Pump Houses & Solar Pumping Arrays
+      farmGroup = new THREE.Group();
+      scene.add(farmGroup);
+      buildFarmsAndSolarPumps();
+
+      // 11. Monitoring Well Piezometers (Real WGS84 Geodesic Placement)
+      wellGroup = new THREE.Group();
+      scene.add(wellGroup);
+      instantiateMonitoringWells(waterY);
+
+      // 12. Thar Desert Xerophytic Ecosystem & Flora (Khejri, Rohida, Sewan Grass)
+      floraGroup = new THREE.Group();
+      scene.add(floraGroup);
+      buildTharFlora();
+
+      // 13. Dynamic Atmosphere, Layered Drifting Clouds, Wildlife & Rain Simulation
+      cloudGroup = new THREE.Group();
+      scene.add(cloudGroup);
+      wildlifeGroup = new THREE.Group();
+      scene.add(wildlifeGroup);
+      buildCloudsAndAtmosphere();
+      buildWildlife();
+      createFlowParticles(waterY);
+      createDustParticles();
+      createRainParticles();
+
+      // 14. Raycasting & User Interaction
+      raycaster = new THREE.Raycaster();
+      mouse = new THREE.Vector2();
+      window.addEventListener('resize', onWindowResize);
+      wrap.addEventListener('mousemove', onMouseMove);
+      wrap.addEventListener('click', onCanvasClick);
+
+      // Apply initial settings
+      applyAmbiance(CFG.initialAmbiance);
+      if (CFG.initialCutaway && CFG.initialCutaway !== 'Complete Surface Landscape') {
+        if (CFG.initialCutaway.includes('Partial')) applyCutawayMode('partial');
+        else if (CFG.initialCutaway.includes('Full')) applyCutawayMode('full');
+        else if (CFG.initialCutaway.includes('Cross')) applyCutawayMode('cross');
+        else if (CFG.initialCutaway.includes('Groundwater')) applyCutawayMode('groundwater');
+        else if (CFG.initialCutaway.includes('Combined')) applyCutawayMode('combined');
+      }
+
+      // Animation Render Loop
+      let clock = new THREE.Clock();
+      function animate() {
+        requestAnimationFrame(animate);
+        const delta = clock.getDelta();
+        const elapsed = clock.getElapsedTime();
+
+        // Smooth camera tweening
+        if (isAnimatingCamera) {
+          const progress = (performance.now() - animStartTime) / animDuration;
+          if (progress >= 1.0) {
+            camera.position.copy(camEndPos);
+            controls.target.copy(camEndTarget);
+            isAnimatingCamera = false;
+          } else {
+            const ease = 1.0 - Math.pow(1.0 - progress, 3); // Cubic ease out
+            camera.position.lerpVectors(camStartPos, camEndPos, ease);
+            controls.target.lerpVectors(camStartTarget, camEndTarget, ease);
+          }
+        }
+
+        // River water normal ripples animation
+        if (riverGroup && riverGroup.userData.waterMaterial) {
+          riverGroup.userData.waterMaterial.opacity = (CFG.rainfall > 20) ? 0.90 : 0.75;
+        }
+
+        // Drifting Clouds
+        if (cloudGroup && cloudGroup.visible) {
+          cloudGroup.children.forEach((cloud, i) => {
+            cloud.position.x += delta * (0.8 + i * 0.1);
+            if (cloud.position.x > 85) cloud.position.x = -85;
+          });
+        }
+
+        // Soaring Wildlife (Eagles circling thermal currents over Aravalli ridges)
+        if (wildlifeGroup && wildlifeGroup.visible) {
+          wildlifeGroup.children.forEach((bird, i) => {
+            const angle = elapsed * 0.45 + i * 2.1;
+            const radius = 18 + i * 6;
+            bird.position.x = 35 + Math.cos(angle) * radius;
+            bird.position.z = 10 + Math.sin(angle) * radius;
+            bird.position.y = 28 + Math.sin(elapsed * 0.8 + i) * 2.5;
+            bird.rotation.y = -angle - Math.PI / 2;
+          });
+        }
+
+        // Dynamic 3D Groundwater Darcy Flow Particles
+        if (flowParticles && flowParticles.visible) {
+          const fPos = flowParticles.geometry.attributes.position.array;
+          for (let i = 0; i < 400; i++) {
+            // Regional hydraulic gradient flow from NE to SW
+            fPos[i * 3 + 0] -= 0.055;
+            fPos[i * 3 + 2] -= 0.038;
+            fPos[i * 3 + 1] = waterY + 0.04 + Math.sin(fPos[i * 3 + 0] * 0.2) * 0.03;
+            if (fPos[i * 3 + 0] < -70) fPos[i * 3 + 0] = 70;
+            if (fPos[i * 3 + 2] < -70) fPos[i * 3 + 2] = 70;
+          }
+          flowParticles.geometry.attributes.position.needsUpdate = true;
+        }
+
+        // Drifting Desert Sand Dust
+        if (dustParticles && dustParticles.visible) {
+          const dPos = dustParticles.geometry.attributes.position.array;
+          for (let i = 0; i < 450; i++) {
+            dPos[i * 3 + 0] += 0.06;
+            dPos[i * 3 + 2] += 0.04;
+            if (dPos[i * 3 + 0] > 75) dPos[i * 3 + 0] = -75;
+            if (dPos[i * 3 + 2] > 75) dPos[i * 3 + 2] = -75;
+          }
+          dustParticles.geometry.attributes.position.needsUpdate = true;
+        }
+
+        // Rainfall animation if active
+        if (rainParticles && rainParticles.visible) {
+          const rPos = rainParticles.geometry.attributes.position.array;
+          for (let i = 0; i < 500; i++) {
+            rPos[i * 3 + 1] -= 0.85;
+            if (rPos[i * 3 + 1] < -2) rPos[i * 3 + 1] = 60;
+          }
+          rainParticles.geometry.attributes.position.needsUpdate = true;
+        }
+
+        // Update North compass rose rotation
+        const compass = document.getElementById('compass-rose');
+        if (compass && controls) {
+          const az = controls.getAzimuthalAngle();
+          compass.style.transform = `rotate(${-az}rad)`;
+        }
+
+        controls.update();
+        renderer.render(scene, camera);
+      }
+      animate();
+    }
+
+    // -------------------------------------------------------------
+    // REGIONAL GEOMORPHOLOGY & ELEVATION SAMPLING (50 km Territory)
+    // -------------------------------------------------------------
+    function sampleRegionalElevationRaw(x, z) {
+      // 1. Regional topographic slope (Luni basin drainage tilts NE down towards SW)
+      const baseTilt = (-x * 0.045 + z * 0.035);
+
+      // 2. Aravalli Mountain Range (East & Southeast sector: x > -15, aligned NE-SW)
+      let aravalli = 0;
+      if (x > -18) {
+        // Ridge axis 1 (Main Aravalli Strike Ridge)
+        const dRidge1 = Math.abs(x - 30 - Math.sin(z * 0.07) * 14);
+        const r1 = Math.max(0, 1.0 - dRidge1 / 15.0);
+        const h1 = Math.pow(r1, 1.7) * 19.5;
+
+        // Ridge axis 2 (Secondary Parallel Ridge)
+        const dRidge2 = Math.abs(x - 52 - Math.cos(z * 0.06) * 10);
+        const r2 = Math.max(0, 1.0 - dRidge2 / 14.0);
+        const h2 = Math.pow(r2, 1.7) * 22.0;
+
+        // Transverse gullies, saddle gaps & crags
+        const crags = Math.sin(z * 0.25) * Math.cos(x * 0.18) * 2.2;
+        aravalli = (h1 + h2 + (h1 > 1.0 || h2 > 1.0 ? crags : 0));
+      }
+
+      // 3. Luni Ephemeral River Channel Incision
+      const riverCenterZ = getLuniRiverCenterZ(x);
+      const dRiv = Math.abs(z - riverCenterZ);
+      let riverIncision = 0;
+      if (dRiv < 6.5 && x < 45) {
+        riverIncision = -Math.pow(1.0 - dRiv / 6.5, 2) * 2.5;
+      }
+
+      // 4. Western Thar Aeolian Dunefield (West & Northwest sector: x < 20)
+      let dunes = 0;
+      if (x < 22) {
+        const u = (x * 0.78 + z * 0.62) * 0.14;
+        const v = (-x * 0.62 + z * 0.78) * 0.14;
+        // Longitudinal Seif dunes
+        const seif = 2.4 * Math.sin(v * 4.2 + 0.35 * Math.sin(u * 2.6));
+        // Asymmetric Barchan dunes
+        const barchan = 1.7 * (Math.sin(u * 5.2) + 0.3 * Math.sin(u * 10.4));
+        // Interdunal deflation swales
+        const swale = -1.2 * Math.cos(v * 2.0);
+        const duneWeight = Math.max(0, Math.min(1.0, (22 - x) / 50.0));
+        dunes = (seif + barchan + swale) * duneWeight;
+      }
+
+      // 5. Undulating central alluvial pediment plain
+      const pediment = 1.4 * Math.sin(x * 0.06) * Math.cos(z * 0.06) + 2.0;
+
+      return baseTilt + aravalli + riverIncision + dunes + pediment;
+    }
+
+    function sampleRegionalElevation(x, z) {
+      const exag = parseFloat(document.getElementById('exaggeration-slider') ? document.getElementById('exaggeration-slider').value : 1.5);
+      return sampleRegionalElevationRaw(x, z) * exag;
+    }
+
+    function getLuniRiverCenterZ(x) {
+      // Sinuous Luni river channel from Aravalli origins through Govindgarh to SW
+      return 6.5 * Math.sin(x * 0.065) - 0.55 * x - 3.5;
+    }
+
+    // -------------------------------------------------------------
+    // 6. BUILD REGIONAL 50 KM TERRAIN MESH WITH MULTI-ZONE SHADING
+    // -------------------------------------------------------------
+    function buildRegional50kmTerrain() {
+      // 150x150 world extent = 100 km diameter (50 km radius circular area)
+      const segments = 140;
+      terrainGeom = new THREE.PlaneGeometry(150, 150, segments, segments);
+      terrainGeom.rotateX(-Math.PI / 2);
+
+      const pos = terrainGeom.attributes.position;
+      const colors = [];
+      baseHeights = new Float32Array(pos.count);
+      const exag = CFG.initialExaggeration || 1.5;
+
+      for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i);
+        const z = pos.getZ(i);
+        const rawH = sampleRegionalElevationRaw(x, z);
+        baseHeights[i] = rawH;
+        pos.setY(i, rawH * exag);
+
+        // Geomorphological Multi-Zone Vertex Coloring
+        const dRiv = Math.abs(z - getLuniRiverCenterZ(x));
+        let r, g, b;
+
+        // Zone 1: Aravalli Rocky Mountain Ridges (high elevation in eastern quadrant)
+        if (x > -10 && rawH > 7.5) {
+          const rockT = Math.min(1.0, (rawH - 7.5) / 14.0);
+          if (rockT > 0.6) { // Quartzite ridge crests
+            r = 0.45; g = 0.42; b = 0.40;
+          } else { // Weathered metamorphic scree
+            r = 0.58; g = 0.38; b = 0.22;
+          }
+        }
+        // Zone 2: Ephemeral Luni River Valley Bed
+        else if (dRiv < 4.2 && x < 40) {
+          if (dRiv < 2.0) { // Active channel sandbar
+            r = 0.88; g = 0.78; b = 0.60;
+          } else { // Riparian alluvial silt
+            r = 0.62; g = 0.52; b = 0.34;
+          }
+        }
+        // Zone 3: Western Thar Sand Dunes (x < 0)
+        else if (x < -8) {
+          const duneNorm = (rawH + 1.0) / 7.0;
+          if (duneNorm > 0.75) { // Sunlit dune crest
+            r = 0.96; g = 0.86; b = 0.54;
+          } else if (duneNorm > 0.40) { // Golden Thar sand flank
+            r = 0.86; g = 0.54; b = 0.18;
+          } else { // Interdunal silt flat
+            r = 0.68; g = 0.38; b = 0.14;
+          }
+        }
+        // Zone 4: Central Alluvial Floodplain & Agricultural Cadastral Mosaic
+        else {
+          // Procedural agricultural field parcel hashing
+          const gridX = Math.floor((x + 80) / 4.2);
+          const gridZ = Math.floor((z + 80) / 4.2);
+          const parcelHash = Math.abs(Math.sin(gridX * 12.9898 + gridZ * 78.233)) * 10000;
+          const parcelType = Math.floor(parcelHash) % 5;
+
+          if (parcelType === 0) { // Irrigated green Kharif/Rabi crops (Bajra, Mustard, Wheat)
+            r = 0.14; g = 0.50; b = 0.20;
+          } else if (parcelType === 1) { // Fresh irrigated green
+            r = 0.20; g = 0.60; b = 0.26;
+          } else if (parcelType === 2) { // Golden harvest parcel
+            r = 0.82; g = 0.64; b = 0.16;
+          } else if (parcelType === 3) { // Dark plowed clay loam
+            r = 0.42; g = 0.28; b = 0.16;
+          } else { // Arid fallow pasture / pediment
+            r = 0.70; g = 0.48; b = 0.24;
+          }
+        }
+
+        colors.push(r, g, b);
+      }
+
+      terrainGeom.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+      terrainGeom.computeVertexNormals();
+
+      const terrainMat = new THREE.MeshStandardMaterial({
+        vertexColors: true,
+        roughness: (CFG.rainfall > 10) ? 0.35 : 0.82,
+        metalness: 0.05,
+        side: THREE.DoubleSide,
+        clippingPlanes: [clipPlaneX],
+        clipShadows: true,
+      });
+
+      terrainMesh = new THREE.Mesh(terrainGeom, terrainMat);
+      terrainMesh.receiveShadow = true;
+      terrainMesh.castShadow = true;
+      scene.add(terrainMesh);
+    }
+
+    // -------------------------------------------------------------
+    // 7. SUBSURFACE 3D STRATIGRAPHY (6 Solid Strata Blocks)
+    // -------------------------------------------------------------
+    function buildSubsurfaceStratigraphy(waterY) {
+      // Strata horizontal dimensions match 50 km coverage (150x150 units)
+      // 1. Saturated Luni Principal Aquifer Water Table
+      const waterGeom = new THREE.PlaneGeometry(148, 148, 48, 48);
+      waterGeom.rotateX(-Math.PI / 2);
+      const waterMat = new THREE.MeshStandardMaterial({
+        color: 0x00b4d8,
+        roughness: 0.15,
+        metalness: 0.60,
+        transparent: true,
+        opacity: 0.82,
+        side: THREE.DoubleSide,
+      });
+      waterMesh = new THREE.Mesh(waterGeom, waterMat);
+      waterMesh.position.y = waterY;
+      scene.add(waterMesh);
+
+      // 2. Vadose Zone Murrum & Kankar Block
+      const vadoseGeom = new THREE.BoxGeometry(148, 4.2, 148);
+      const vadoseMat = new THREE.MeshStandardMaterial({
+        color: 0x854d0e,
+        roughness: 0.90,
+        side: THREE.DoubleSide,
+        clippingPlanes: [clipPlaneX],
+      });
+      vadoseMesh = new THREE.Mesh(vadoseGeom, vadoseMat);
+      vadoseMesh.position.y = waterY - 2.1;
+      scene.add(vadoseMesh);
+
+      // 3. Fractured Quartzite & Weathered Sandstone Block
+      const fracGeom = new THREE.BoxGeometry(148, 3.8, 148);
+      const fracMat = new THREE.MeshStandardMaterial({
+        color: 0xb45309,
+        roughness: 0.88,
+        side: THREE.DoubleSide,
+        clippingPlanes: [clipPlaneX],
+      });
+      fracturedMesh = new THREE.Mesh(fracGeom, fracMat);
+      fracturedMesh.position.y = waterY - 6.1;
+      scene.add(fracturedMesh);
+
+      // 4. Confining Clayey Aquitard Block
+      const aquitardGeom = new THREE.BoxGeometry(148, 2.5, 148);
+      const aquitardMat = new THREE.MeshStandardMaterial({
+        color: 0x475569,
+        roughness: 0.92,
+        side: THREE.DoubleSide,
+        clippingPlanes: [clipPlaneX],
+      });
+      aquitardMesh = new THREE.Mesh(aquitardGeom, aquitardMat);
+      aquitardMesh.position.y = waterY - 9.25;
+      scene.add(aquitardMesh);
+
+      // 5. Deep Pre-Cambrian Malani Granite Basement Block
+      const bedrockGeom = new THREE.BoxGeometry(148, 5.0, 148);
+      const bedrockMat = new THREE.MeshStandardMaterial({
+        color: 0x0f172a,
+        roughness: 0.95,
+        side: THREE.DoubleSide,
+        clippingPlanes: [clipPlaneX],
+      });
+      bedrockMesh = new THREE.Mesh(bedrockGeom, bedrockMat);
+      bedrockMesh.position.y = waterY - 13.0;
+      scene.add(bedrockMesh);
+    }
+
+    // -------------------------------------------------------------
+    // 8. LUNI RIVER NETWORK, TRIBUTARIES & HIGHWAY BRIDGE
+    // -------------------------------------------------------------
+    function buildLuniRiverNetwork() {
+      // Primary Luni river course curving across 50 km from Aravalli hills to SW
+      const mainPts = [];
+      for (let x = -70; x <= 45; x += 3) {
+        const z = getLuniRiverCenterZ(x);
+        const y = sampleRegionalElevation(x, z) + 0.12;
+        mainPts.push(new THREE.Vector3(x, y, z));
+      }
+      const curve = new THREE.CatmullRomCurve3(mainPts);
+      const riverGeom = new THREE.TubeGeometry(curve, 90, 1.35, 8, false);
+
+      const isMonsoon = (CFG.rainfall >= 25.0);
+      const riverMat = new THREE.MeshStandardMaterial({
+        color: isMonsoon ? 0x0284c7 : 0x0ea5e9,
+        roughness: isMonsoon ? 0.15 : 0.35,
+        metalness: isMonsoon ? 0.65 : 0.25,
+        transparent: true,
+        opacity: isMonsoon ? 0.92 : 0.78,
+        clippingPlanes: [clipPlaneX],
+      });
+      const riverMesh = new THREE.Mesh(riverGeom, riverMat);
+      riverGroup.add(riverMesh);
+      riverGroup.userData.waterMaterial = riverMat;
+
+      // Tributary Creek (Saraswati nallah from Pushkar valley joining at Govindgarh)
+      const tribPts = [];
+      for (let t = 0; t <= 1.0; t += 0.05) {
+        const tx = 22 * (1 - t) - 4 * t;
+        const tz = 28 * (1 - t) + 0 * t;
+        const ty = sampleRegionalElevation(tx, tz) + 0.08;
+        tribPts.push(new THREE.Vector3(tx, ty, tz));
+      }
+      const tribCurve = new THREE.CatmullRomCurve3(tribPts);
+      const tribGeom = new THREE.TubeGeometry(tribCurve, 30, 0.65, 6, false);
+      const tribMesh = new THREE.Mesh(tribGeom, riverMat);
+      riverGroup.add(tribMesh);
+
+      // Concrete Girder Highway Bridge crossing the Luni River near Govindgarh
+      const bridgeX = -4, bridgeZ = getLuniRiverCenterZ(bridgeX);
+      const bridgeY = sampleRegionalElevation(bridgeX, bridgeZ) + 1.6;
+
+      const deckGeom = new THREE.BoxGeometry(3.6, 0.45, 12);
+      const concreteMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, roughness: 0.85, clippingPlanes: [clipPlaneX] });
+      const deck = new THREE.Mesh(deckGeom, concreteMat);
+      deck.position.set(bridgeX, bridgeY, bridgeZ);
+      deck.castShadow = true;
+      riverGroup.add(deck);
+
+      // Bridge Support Piers
+      [-3.8, 3.8].forEach(pz => {
+        const pierGeom = new THREE.CylinderGeometry(0.5, 0.6, 3.2, 8);
+        const pier = new THREE.Mesh(pierGeom, concreteMat);
+        pier.position.set(bridgeX, bridgeY - 1.6, bridgeZ + pz);
+        pier.castShadow = true;
+        riverGroup.add(pier);
+      });
+
+      // Bridge Railings
+      const railGeom = new THREE.BoxGeometry(0.12, 0.6, 12);
+      const railMat = new THREE.MeshStandardMaterial({ color: 0xef4444, metalness: 0.4 });
+      const rail1 = new THREE.Mesh(railGeom, railMat);
+      rail1.position.set(bridgeX - 1.65, bridgeY + 0.5, bridgeZ);
+      const rail2 = new THREE.Mesh(railGeom, railMat);
+      rail2.position.set(bridgeX + 1.65, bridgeY + 0.5, bridgeZ);
+      riverGroup.add(rail1);
+      riverGroup.add(rail2);
+    }
+
+    // -------------------------------------------------------------
+    // 9. SETTLEMENTS, RAJASTHANI ARCHITECTURE & ROAD NETWORK
+    // -------------------------------------------------------------
+    function buildSettlementsAndRoads() {
+      // 5 Named Regional Villages/Tehsils in the Upper Luni Basin:
+      const settlements = [
+        { name: "Govindgarh", x: -8, z: -2, count: 24 },    // Confluence hub
+        { name: "Pushkar Rural", x: 24, z: 28, count: 20 }, // Aravalli sacred valley
+        { name: "Pisangan", x: -36, z: -18, count: 22 },    // Agricultural plain hub
+        { name: "Srinagar", x: 38, z: -6, count: 18 },      // Eastern pediment township
+        { name: "Saradhna", x: 6, z: -28, count: 18 },      // Southern transport corridor
+      ];
+
+      settlements.forEach(s => {
+        const villageGroup = new THREE.Group();
+        villageGroup.userData = { name: s.name, x: s.x, z: s.z };
+
+        // Village Buildings
+        for (let b = 0; b < s.count; b++) {
+          const ox = s.x + (Math.random() - 0.5) * 11;
+          const oz = s.z + (Math.random() - 0.5) * 11;
+          const oy = sampleRegionalElevation(ox, oz);
+
+          const w = 1.4 + Math.random() * 1.2;
+          const h = 1.2 + Math.random() * 1.0;
+          const d = 1.4 + Math.random() * 1.2;
+
+          // Sandstone / Whitewashed House
+          const houseGeom = new THREE.BoxGeometry(w, h, d);
+          const isWhite = Math.random() > 0.45;
+          const houseMat = new THREE.MeshStandardMaterial({
+            color: isWhite ? 0xf1f5f9 : 0xd4a373,
+            roughness: 0.88,
+            clippingPlanes: [clipPlaneX],
+          });
+          const house = new THREE.Mesh(houseGeom, houseMat);
+          house.position.set(ox, oy + h / 2, oz);
+          house.castShadow = true;
+          house.receiveShadow = true;
+          villageGroup.add(house);
+
+          // Rooftop Sintex / Concrete Water Storage Tank
+          if (Math.random() > 0.35) {
+            const tankGeom = new THREE.CylinderGeometry(0.22, 0.22, 0.45, 8);
+            const isBlue = Math.random() > 0.4;
+            const tankMat = new THREE.MeshStandardMaterial({ color: isBlue ? 0x0284c7 : 0xffffff, roughness: 0.4 });
+            const tank = new THREE.Mesh(tankGeom, tankMat);
+            tank.position.set(ox + 0.3, oy + h + 0.22, oz + 0.3);
+            villageGroup.add(tank);
+          }
+        }
+
+        // Traditional Village Stepwell (Baori)
+        const baoriY = sampleRegionalElevation(s.x + 3.5, s.z + 3.5);
+        const baoriGeom = new THREE.CylinderGeometry(1.8, 1.4, 1.5, 8);
+        const baoriMat = new THREE.MeshStandardMaterial({ color: 0x78716c, roughness: 0.95, clippingPlanes: [clipPlaneX] });
+        const baori = new THREE.Mesh(baoriGeom, baoriMat);
+        baori.position.set(s.x + 3.5, baoriY + 0.3, s.z + 3.5);
+        baori.castShadow = true;
+        villageGroup.add(baori);
+
+        // Traditional Domed Pavilion (Chhatri) on high ground
+        const chhatriY = sampleRegionalElevation(s.x - 3.8, s.z - 3.8);
+        const chhatriDomeGeom = new THREE.SphereGeometry(0.9, 12, 12, 0, Math.PI * 2, 0, Math.PI / 2);
+        const chhatriMat = new THREE.MeshStandardMaterial({ color: 0xe2e8f0, roughness: 0.75, clippingPlanes: [clipPlaneX] });
+        const dome = new THREE.Mesh(chhatriDomeGeom, chhatriMat);
+        dome.position.set(s.x - 3.8, chhatriY + 2.4, s.z - 3.8);
+        villageGroup.add(dome);
+
+        // 4 Chhatri Pillars
+        [[-0.6, -0.6], [-0.6, 0.6], [0.6, -0.6], [0.6, 0.6]].forEach(pil => {
+          const pilGeom = new THREE.CylinderGeometry(0.08, 0.08, 2.2, 6);
+          const pillar = new THREE.Mesh(pilGeom, chhatriMat);
+          pillar.position.set(s.x - 3.8 + pil[0], chhatriY + 1.1, s.z - 3.8 + pil[1]);
+          villageGroup.add(pillar);
+        });
+
+        // Traditional Rainwater Harvesting Kund / Tanka
+        const tankaY = sampleRegionalElevation(s.x - 4.5, s.z + 4.5);
+        const tankaApronGeom = new THREE.CylinderGeometry(2.4, 2.8, 0.15, 12);
+        const tankaMat = new THREE.MeshStandardMaterial({ color: 0xa8a29e, roughness: 0.9, clippingPlanes: [clipPlaneX] });
+        const tankaApron = new THREE.Mesh(tankaApronGeom, tankaMat);
+        tankaApron.position.set(s.x - 4.5, tankaY + 0.08, s.z + 4.5);
+        villageGroup.add(tankaApron);
+
+        const tankaDomeGeom = new THREE.SphereGeometry(0.75, 10, 10, 0, Math.PI * 2, 0, Math.PI / 2);
+        const tankaDome = new THREE.Mesh(tankaDomeGeom, tankaMat);
+        tankaDome.position.set(s.x - 4.5, tankaY + 0.15, s.z + 4.5);
+        villageGroup.add(tankaDome);
+
+        settlementGroup.add(villageGroup);
+      });
+
+      // Paved 2-Lane State Highway connecting settlements across 50 km extent
+      const roadPts = [
+        new THREE.Vector3(55, 0, 40),
+        new THREE.Vector3(38, 0, 24),
+        new THREE.Vector3(20, 0, 12),
+        new THREE.Vector3(4, 0, 2),
+        new THREE.Vector3(-4, 0, -2),   // Over bridge
+        new THREE.Vector3(-18, 0, -10),
+        new THREE.Vector3(-36, 0, -18),  // Through Pisangan
+        new THREE.Vector3(-58, 0, -32),
+      ];
+      roadPts.forEach(pt => {
+        pt.y = sampleRegionalElevation(pt.x, pt.z) + 0.16;
+      });
+      const roadCurve = new THREE.CatmullRomCurve3(roadPts);
+      const roadGeom = new THREE.TubeGeometry(roadCurve, 64, 0.75, 4, false);
+      const roadMat = new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.92, clippingPlanes: [clipPlaneX] });
+      const roadMesh = new THREE.Mesh(roadGeom, roadMat);
+      roadGroup.add(roadMesh);
+
+      // High-Voltage Electrical Transmission Pylons across the basin
+      const pylonCoords = [[-42, 28], [-24, 20], [-6, 14], [12, 6], [30, -2], [48, -10]];
+      pylonCoords.forEach(c => {
+        const py = sampleRegionalElevation(c[0], c[1]);
+        const pylonGroup = new THREE.Group();
+        const bodyGeom = new THREE.CylinderGeometry(0.3, 0.8, 6.5, 4);
+        const pylonMat = new THREE.MeshStandardMaterial({ color: 0x64748b, wireframe: true, clippingPlanes: [clipPlaneX] });
+        const pylon = new THREE.Mesh(bodyGeom, pylonMat);
+        pylon.position.y = py + 3.25;
+        pylonGroup.add(pylon);
+
+        const armGeom = new THREE.BoxGeometry(3.2, 0.12, 0.12);
+        const arm = new THREE.Mesh(armGeom, pylonMat);
+        arm.position.y = py + 5.5;
+        pylonGroup.add(arm);
+
+        pylonGroup.position.set(c[0], 0, c[1]);
+        roadGroup.add(pylonGroup);
+      });
+    }
+
+    // -------------------------------------------------------------
+    // 10. FARMS, TUBE-WELL PUMP HOUSES & SOLAR IRRIGATION PUMPS
+    // -------------------------------------------------------------
+    function buildFarmsAndSolarPumps() {
+      // Tube-well pump houses & solar panels scattered in the agricultural plains
+      const pumpLocs = [
+        [-16, 8], [-22, -6], [-12, -18], [-28, 14], [12, -14],
+        [18, 10], [-4, 22], [-32, -8], [2, -18], [28, -14]
+      ];
+
+      pumpLocs.forEach(loc => {
+        const py = sampleRegionalElevation(loc[0], loc[1]);
+        const group = new THREE.Group();
+
+        // Masonry Pump Shed (Kuan Kothi)
+        const shedGeom = new THREE.BoxGeometry(1.6, 1.3, 1.6);
+        const shedMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, roughness: 0.9, clippingPlanes: [clipPlaneX] });
+        const shed = new THREE.Mesh(shedGeom, shedMat);
+        shed.position.set(0, 0.65, 0);
+        shed.castShadow = true;
+        group.add(shed);
+
+        // Blue Electric Pump Motor & Discharge Pipe
+        const pipeGeom = new THREE.CylinderGeometry(0.1, 0.1, 1.2, 8);
+        const pipeMat = new THREE.MeshStandardMaterial({ color: 0x0284c7, metalness: 0.7 });
+        const pipe = new THREE.Mesh(pipeGeom, pipeMat);
+        pipe.rotation.z = Math.PI / 2;
+        pipe.position.set(1.1, 0.4, 0);
+        group.add(pipe);
+
+        // Solar Photovoltaic Pumping Array (4-panel array tilted 26 deg South)
+        const solarGeom = new THREE.BoxGeometry(1.8, 0.04, 1.2);
+        const solarMat = new THREE.MeshStandardMaterial({ color: 0x1e3a8a, metalness: 0.75, roughness: 0.25 });
+        const solar = new THREE.Mesh(solarGeom, solarMat);
+        solar.position.set(-1.4, 1.1, 0);
+        solar.rotation.x = 0.45; // South-facing tilt
+        solar.castShadow = true;
+        group.add(solar);
+
+        const poleGeom = new THREE.CylinderGeometry(0.06, 0.06, 1.0, 6);
+        const poleMat = new THREE.MeshStandardMaterial({ color: 0x475569 });
+        const pole = new THREE.Mesh(poleGeom, poleMat);
+        pole.position.set(-1.4, 0.5, 0);
+        group.add(pole);
+
+        group.position.set(loc[0], py, loc[1]);
+        farmGroup.add(group);
+      });
+    }
+
+    // -------------------------------------------------------------
+    // 11. MONITORING WELLS (WGS84 Geodesic Placement)
+    // -------------------------------------------------------------
+    function instantiateMonitoringWells(waterY) {
+      const wells = CFG.wells || [];
+      if (wells.length === 0) return;
+
+      let minLat = 90, maxLat = -90, minLon = 180, maxLon = -180;
+      wells.forEach(w => {
+        if (w.lat < minLat) minLat = w.lat;
+        if (w.lat > maxLat) maxLat = w.lat;
+        if (w.lon < minLon) minLon = w.lon;
+        if (w.lon > maxLon) maxLon = w.lon;
+      });
+      const spanLat = Math.max(maxLat - minLat, 0.01);
+      const spanLon = Math.max(maxLon - minLon, 0.01);
+      const midLat = (minLat + maxLat) / 2;
+      const midLon = (minLon + maxLon) / 2;
+
+      wells.forEach(w => {
+        // Map to 50 km coordinate frame (span 110 units across)
+        const relX = ((w.lon - midLon) / spanLon) * 110;
+        const relZ = -((w.lat - midLat) / spanLat) * 110;
+        const groundY = sampleRegionalElevation(relX, relZ);
+
+        const group = new THREE.Group();
+        group.userData = w;
+
+        // Borehole Tube extending down into the aquifer
+        const tubeH = Math.max(2.0, groundY - waterY + 2.0);
+        const tubeGeom = new THREE.CylinderGeometry(0.2, 0.2, tubeH, 8);
+        const tubeMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, metalness: 0.85, roughness: 0.2 });
+        const tube = new THREE.Mesh(tubeGeom, tubeMat);
+        tube.position.y = groundY - tubeH / 2;
+        tube.castShadow = true;
+        group.add(tube);
+
+        // Concrete Apron
+        const apronGeom = new THREE.CylinderGeometry(1.2, 1.4, 0.35, 8);
+        const apronMat = new THREE.MeshStandardMaterial({ color: 0x64748b, roughness: 0.9 });
+        const apron = new THREE.Mesh(apronGeom, apronMat);
+        apron.position.y = groundY + 0.17;
+        group.add(apron);
+
+        // Telemetry Datalogger Mast
+        const mastGeom = new THREE.CylinderGeometry(0.08, 0.08, 2.5, 6);
+        const mastMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, metalness: 0.9 });
+        const mast = new THREE.Mesh(mastGeom, mastMat);
+        mast.position.y = groundY + 1.5;
+        group.add(mast);
+
+        // Status-Coded LED Beacon Sphere with Halo
+        const ledGeom = new THREE.SphereGeometry(0.35, 12, 12);
+        const ledMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(w.color) });
+        const led = new THREE.Mesh(ledGeom, ledMat);
+        led.position.set(0, groundY + 2.8, 0);
+        group.add(led);
+
+        // South-Facing Solar PV Panel
+        const panelGeom = new THREE.BoxGeometry(1.3, 0.05, 0.9);
+        const panelMat = new THREE.MeshStandardMaterial({ color: 0x1e3a8a, metalness: 0.6 });
+        const panel = new THREE.Mesh(panelGeom, panelMat);
+        panel.position.set(0, groundY + 2.3, 0);
+        panel.rotation.x = 0.45;
+        group.add(panel);
+
+        // Invisible Raycasting Hit Proxy
+        const hitGeom = new THREE.CylinderGeometry(1.6, 1.6, 4.0, 8);
+        const hitMat = new THREE.MeshBasicMaterial({ visible: false });
+        const hit = new THREE.Mesh(hitGeom, hitMat);
+        hit.position.y = groundY + 2.0;
+        hit.userData = w;
+        group.add(hit);
+
+        group.position.set(relX, 0, relZ);
+        wellGroup.add(group);
+
+        if (w.village === activeSelectedWell || w.isSelected) {
+          selectedWellCoords = { x: relX, y: groundY, z: relZ };
+          updateInspectorPanel(w);
+        }
+      });
+    }
+
+    // -------------------------------------------------------------
+    // 12. THAR DESERT FLORA (Khejri, Rohida, Sewan Grass)
+    // -------------------------------------------------------------
+    function buildTharFlora() {
+      // 1. Instanced Khejri Trees (Prosopis cineraria) - State Tree of Rajasthan
+      const khejriCount = 140;
+      const trunkGeom = new THREE.CylinderGeometry(0.18, 0.32, 2.2, 6);
+      const trunkMat = new THREE.MeshStandardMaterial({ color: 0x5c2c0e, roughness: 0.92, clippingPlanes: [clipPlaneX] });
+      const canopyGeom = new THREE.CylinderGeometry(2.0, 0.6, 0.8, 8);
+      const canopyMat = new THREE.MeshStandardMaterial({ color: 0x3f6212, roughness: 0.82, clippingPlanes: [clipPlaneX] });
+
+      const trunkInst = new THREE.InstancedMesh(trunkGeom, trunkMat, khejriCount);
+      const canopyInst = new THREE.InstancedMesh(canopyGeom, canopyMat, khejriCount);
+      const mat4 = new THREE.Matrix4();
+      const posV = new THREE.Vector3();
+      const quat = new THREE.Quaternion();
+      const scaleV = new THREE.Vector3(1, 1, 1);
+
+      let placed = 0;
+      for (let i = 0; i < khejriCount; i++) {
+        const tx = (Math.random() - 0.5) * 130;
+        const tz = (Math.random() - 0.5) * 130;
+        const ty = sampleRegionalElevation(tx, tz);
+
+        // Place mainly on plains, dunes and field edges (not steep mountains)
+        if (ty < 12.0) {
+          posV.set(tx, ty + 1.1, tz);
+          mat4.compose(posV, quat, scaleV);
+          trunkInst.setMatrixAt(placed, mat4);
+
+          posV.set(tx, ty + 2.4, tz);
+          mat4.compose(posV, quat, scaleV);
+          canopyInst.setMatrixAt(placed, mat4);
+          placed++;
+        }
+      }
+      trunkInst.count = placed;
+      canopyInst.count = placed;
+      trunkInst.castShadow = true;
+      canopyInst.castShadow = true;
+      floraGroup.add(trunkInst);
+      floraGroup.add(canopyInst);
+
+      // 2. Instanced Rohida Trees (Tecomella undulata - Desert Teak with Flame Flowers)
+      const rohidaCount = 60;
+      const rCanopyGeom = new THREE.SphereGeometry(1.2, 8, 8);
+      const rCanopyMat = new THREE.MeshStandardMaterial({ color: 0xd97706, roughness: 0.85, clippingPlanes: [clipPlaneX] });
+      const rohidaInst = new THREE.InstancedMesh(rCanopyGeom, rCanopyMat, rohidaCount);
+      for (let j = 0; j < rohidaCount; j++) {
+        const rx = (Math.random() - 0.5) * 120;
+        const rz = (Math.random() - 0.5) * 120;
+        const ry = sampleRegionalElevation(rx, rz);
+        posV.set(rx, ry + 1.4, rz);
+        mat4.compose(posV, quat, scaleV);
+        rohidaInst.setMatrixAt(j, mat4);
+      }
+      floraGroup.add(rohidaInst);
+
+      // 3. Sewan Grass Clumps (Lasiurus scindicus)
+      const grassCount = 180;
+      const grassGeom = new THREE.ConeGeometry(0.65, 0.8, 5);
+      const grassMat = new THREE.MeshStandardMaterial({ color: 0x84cc16, roughness: 0.9, clippingPlanes: [clipPlaneX] });
+      const grassInst = new THREE.InstancedMesh(grassGeom, grassMat, grassCount);
+      for (let g = 0; g < grassCount; g++) {
+        const gx = (Math.random() - 0.5) * 135;
+        const gz = (Math.random() - 0.5) * 135;
+        const gy = sampleRegionalElevation(gx, gz);
+        posV.set(gx, gy + 0.4, gz);
+        mat4.compose(posV, quat, scaleV);
+        grassInst.setMatrixAt(g, mat4);
+      }
+      floraGroup.add(grassInst);
+    }
+
+    // -------------------------------------------------------------
+    // 13. CLOUDS, WILDLIFE & DYNAMIC PARTICLES
+    // -------------------------------------------------------------
+    function buildCloudsAndAtmosphere() {
+      // 14 Volumetric-style Billowy Cloud Puffs drifting over the 50 km sky
+      const cloudGeom = new THREE.DodecahedronGeometry(6.5, 1);
+      const cloudMat = new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        roughness: 0.95,
+        transparent: true,
+        opacity: (CFG.rainfall > 20) ? 0.85 : 0.65,
+      });
+
+      for (let c = 0; c < 14; c++) {
+        const puff = new THREE.Mesh(cloudGeom, cloudMat);
+        puff.position.set(
+          (Math.random() - 0.5) * 150,
+          42 + Math.random() * 12,
+          (Math.random() - 0.5) * 150
+        );
+        puff.scale.set(1.8 + Math.random() * 1.5, 0.6 + Math.random() * 0.4, 1.2 + Math.random() * 1.0);
+        cloudGroup.add(puff);
+      }
+    }
+
+    function buildWildlife() {
+      // 3 Desert Eagles soaring high over the Aravalli peaks
+      const eagleGeom = new THREE.ConeGeometry(0.3, 1.6, 3);
+      eagleGeom.rotateX(Math.PI / 2);
+      const eagleMat = new THREE.MeshBasicMaterial({ color: 0x1e293b });
+      for (let e = 0; e < 3; e++) {
+        const eagle = new THREE.Mesh(eagleGeom, eagleMat);
+        wildlifeGroup.add(eagle);
+      }
+    }
+
+    function createFlowParticles(waterY) {
+      const count = 400;
+      const pGeom = new THREE.BufferGeometry();
+      const pPos = new Float32Array(count * 3);
+      for (let i = 0; i < count; i++) {
+        pPos[i * 3 + 0] = (Math.random() - 0.5) * 140;
+        pPos[i * 3 + 1] = waterY + 0.05;
+        pPos[i * 3 + 2] = (Math.random() - 0.5) * 140;
+      }
+      pGeom.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+      const pMat = new THREE.PointsMaterial({
+        color: 0x00f5ff,
+        size: 0.42,
+        transparent: true,
+        opacity: 0.85,
+      });
+      flowParticles = new THREE.Points(pGeom, pMat);
+      scene.add(flowParticles);
+    }
+
+    function createDustParticles() {
+      const count = 450;
+      const pGeom = new THREE.BufferGeometry();
+      const pPos = new Float32Array(count * 3);
+      for (let i = 0; i < count; i++) {
+        pPos[i * 3 + 0] = (Math.random() - 0.5) * 150;
+        pPos[i * 3 + 1] = Math.random() * 15 + 0.5;
+        pPos[i * 3 + 2] = (Math.random() - 0.5) * 150;
+      }
+      pGeom.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+      const pMat = new THREE.PointsMaterial({
+        color: 0xfde047,
+        size: 0.35,
+        transparent: true,
+        opacity: 0.65,
+      });
+      dustParticles = new THREE.Points(pGeom, pMat);
+      scene.add(dustParticles);
+    }
+
+    function createRainParticles() {
+      const count = 500;
+      const pGeom = new THREE.BufferGeometry();
+      const pPos = new Float32Array(count * 3);
+      for (let i = 0; i < count; i++) {
+        pPos[i * 3 + 0] = (Math.random() - 0.5) * 150;
+        pPos[i * 3 + 1] = Math.random() * 60;
+        pPos[i * 3 + 2] = (Math.random() - 0.5) * 150;
+      }
+      pGeom.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+      const pMat = new THREE.PointsMaterial({
+        color: 0x38bdf8,
+        size: 0.38,
+        transparent: true,
+        opacity: 0.75,
+      });
+      rainParticles = new THREE.Points(pGeom, pMat);
+      rainParticles.visible = (CFG.rainfall > 0);
+      scene.add(rainParticles);
+    }
+
+    // -------------------------------------------------------------
+    // 14. 10 CAMERA PRESETS (Smooth Tweened Transitions)
+    // -------------------------------------------------------------
+    function applyCameraPreset(preset) {
+      document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+      const btn = document.getElementById('btn-' + preset);
+      if (btn) btn.classList.add('active');
+
+      let targetPos = new THREE.Vector3();
+      let targetLook = new THREE.Vector3(0, 0, 0);
+
+      if (preset === 'iso') { // Elevated Isometric View (Default, 35 deg pitch downward, 45 deg azimuth)
+        targetPos.set(68, 52, 68);
+        targetLook.set(0, 0, 0);
+      } else if (preset === 'basin') { // 50 km Basin Regional Overview
+        targetPos.set(0, 115, 110);
+        targetLook.set(0, 0, 0);
+      } else if (preset === 'top') { // Top-Down Satellite GIS View
+        targetPos.set(0, 135, 0.001);
+        targetLook.set(0, 0, 0);
+      } else if (preset === 'oblique') { // Low Oblique Landscape Flyover
+        targetPos.set(75, 16, 75);
+        targetLook.set(0, 3, 0);
+      } else if (preset === 'cutaway') { // Subsurface Cutaway View
+        targetPos.set(58, 28, -52);
+        targetLook.set(0, -4, 0);
+        applyCutawayMode('partial');
+      } else if (preset === 'section') { // Vertical Geological Cross-Section
+        targetPos.set(0, -2, 95);
+        targetLook.set(0, -3, 0);
+        applyCutawayMode('cross');
+      } else if (preset === 'well') { // Selected Well Focus
+        focusSelectedWell();
+        return;
+      } else if (preset === 'village') { // Govindgarh Confluence Settlement Focus
+        targetPos.set(-8 + 14, 10, -2 + 14);
+        targetLook.set(-8, 2.5, -2);
+      } else if (preset === 'river') { // Luni River Corridor Flyover
+        targetPos.set(12, 18, 16);
+        targetLook.set(-18, 2, -6);
+      } else if (preset === 'fit') { // Fit 50 km Extent
+        targetPos.set(60, 48, 60);
+        targetLook.set(0, 0, 0);
+      }
+      animateCameraTo(targetPos, targetLook);
+    }
+
+    function animateCameraTo(endPos, endTarget, durationMs = 1200) {
+      camStartPos.copy(camera.position);
+      camEndPos.copy(endPos);
+      camStartTarget.copy(controls.target);
+      camEndTarget.copy(endTarget);
+      animStartTime = performance.now();
+      animDuration = durationMs;
+      isAnimatingCamera = true;
+    }
+
+    function focusSelectedWell() {
+      const endPos = new THREE.Vector3(selectedWellCoords.x + 9, selectedWellCoords.y + 6, selectedWellCoords.z + 9);
+      const endTarget = new THREE.Vector3(selectedWellCoords.x, selectedWellCoords.y, selectedWellCoords.z);
+      animateCameraTo(endPos, endTarget);
+    }
+
+    // -------------------------------------------------------------
+    // 15. GEOLOGICAL CUTAWAY & SLICER CONTROLS
+    // -------------------------------------------------------------
+    function applyCutawayMode(mode) {
+      document.getElementById('cutaway-select').value = mode;
+      const sliceSlider = document.getElementById('slice-slider');
+      const sliceVal = document.getElementById('slice-val');
+
+      if (mode === 'complete') {
+        clipPlaneX.constant = 95.0;
+        sliceSlider.value = 0;
+        sliceVal.innerText = '0%';
+        terrainMesh.visible = true;
+        terrainMesh.material.transparent = false;
+      } else if (mode === 'partial') {
+        clipPlaneX.constant = 25.0;
+        sliceSlider.value = 35;
+        sliceVal.innerText = '35%';
+        terrainMesh.visible = true;
+        terrainMesh.material.transparent = false;
+      } else if (mode === 'full') {
+        clipPlaneX.constant = 0.0;
+        sliceSlider.value = 50;
+        sliceVal.innerText = '50%';
+        terrainMesh.visible = true;
+        terrainMesh.material.transparent = false;
+      } else if (mode === 'cross') {
+        clipPlaneX.constant = -6.0;
+        sliceSlider.value = 55;
+        sliceVal.innerText = '55%';
+        terrainMesh.visible = true;
+        terrainMesh.material.transparent = false;
+      } else if (mode === 'groundwater') {
+        terrainMesh.visible = false;
+      } else if (mode === 'combined') {
+        clipPlaneX.constant = 95.0;
+        terrainMesh.visible = true;
+        terrainMesh.material.transparent = true;
+        terrainMesh.material.opacity = 0.45;
+      }
+    }
+
+    function onSliceInput(val) {
+      const pct = parseFloat(val);
+      document.getElementById('slice-val').innerText = pct + '%';
+      clipPlaneX.constant = 90.0 - (pct / 100.0) * 170.0;
+      if (pct > 0 && terrainMesh.visible && !terrainMesh.material.transparent) {
+        document.getElementById('cutaway-select').value = 'partial';
+      }
+    }
+
+    function onExaggerationInput(val) {
+      const factor = parseFloat(val);
+      document.getElementById('exaggeration-val').innerText = factor.toFixed(2) + 'x';
+      if (!terrainGeom) return;
+      const pos = terrainGeom.attributes.position;
+      for (let i = 0; i < pos.count; i++) {
+        pos.setY(i, baseHeights[i] * factor);
+      }
+      pos.needsUpdate = true;
+      terrainGeom.computeVertexNormals();
+    }
+
+    // -------------------------------------------------------------
+    // 16. LAYER VISIBILITY DRAWER
+    // -------------------------------------------------------------
+    function updateLayers() {
+      if (terrainMesh) terrainMesh.visible = document.getElementById('chk-terrain').checked;
+      const showStrata = document.getElementById('chk-strata').checked;
+      if (vadoseMesh) vadoseMesh.visible = showStrata;
+      if (fracturedMesh) fracturedMesh.visible = showStrata;
+      if (aquitardMesh) aquitardMesh.visible = showStrata;
+      if (bedrockMesh) bedrockMesh.visible = showStrata;
+      if (waterMesh) waterMesh.visible = document.getElementById('chk-water').checked;
+      if (flowParticles) flowParticles.visible = document.getElementById('chk-flow').checked;
+      if (riverGroup) riverGroup.visible = document.getElementById('chk-river').checked;
+      if (wellGroup) wellGroup.visible = document.getElementById('chk-wells').checked;
+      const showSettlements = document.getElementById('chk-settlements').checked;
+      if (settlementGroup) settlementGroup.visible = showSettlements;
+      if (roadGroup) roadGroup.visible = showSettlements;
+      if (farmGroup) farmGroup.visible = document.getElementById('chk-farms').checked;
+      if (floraGroup) floraGroup.visible = document.getElementById('chk-flora').checked;
+      const showWeather = document.getElementById('chk-weather').checked;
+      if (cloudGroup) cloudGroup.visible = showWeather;
+      if (wildlifeGroup) wildlifeGroup.visible = showWeather;
+      if (rainParticles) rainParticles.visible = showWeather && (CFG.rainfall > 0);
+      if (dustParticles) dustParticles.visible = showWeather;
+    }
+
+    function toggleLayerDrawer() {
+      const p = document.getElementById('layer-panel');
+      p.classList.toggle('open');
+    }
+
+    // -------------------------------------------------------------
+    // 17. ATMOSPHERIC AMBIANCE & LIGHTING MODES
+    // -------------------------------------------------------------
+    function setAmbiance(mode) {
+      currentAmbiance = mode;
+      document.querySelectorAll('.action-btn').forEach(b => {
+        if (b.id && b.id.startsWith('amb-')) b.classList.remove('active');
+      });
+      const btn = document.getElementById('amb-' + mode);
+      if (btn) btn.classList.add('active');
+
+      if (mode === 'day') {
+        scene.background.set(0xfef3c7);
+        scene.fog.color.set(0xfef3c7);
+        scene.fog.density = 0.0055;
+        hemiLight.color.set(0xffedd5);
+        hemiLight.intensity = 0.70;
+        dirLight.color.set(0xfffbeb);
+        dirLight.intensity = 1.45;
+        dirLight.position.set(70, 95, 55);
+        if (sunSphere) { sunSphere.material.color.set(0xfffbeb); sunSphere.visible = true; }
+      } else if (mode === 'sunset') {
+        scene.background.set(0xf97316);
+        scene.fog.color.set(0xea580c);
+        scene.fog.density = 0.007;
+        hemiLight.color.set(0xfde047);
+        hemiLight.intensity = 0.55;
+        dirLight.color.set(0xfb923c);
+        dirLight.intensity = 1.25;
+        dirLight.position.set(85, 25, 45);
+        if (sunSphere) { sunSphere.material.color.set(0xfb923c); sunSphere.visible = true; }
+      } else if (mode === 'night') {
+        scene.background.set(0x070b14);
+        scene.fog.color.set(0x070b14);
+        scene.fog.density = 0.006;
+        hemiLight.color.set(0x1e293b);
+        hemiLight.intensity = 0.35;
+        dirLight.color.set(0x38bdf8);
+        dirLight.intensity = 0.40;
+        dirLight.position.set(-50, 75, -50);
+        if (sunSphere) sunSphere.visible = false;
+      } else if (mode === 'storm') {
+        scene.background.set(0x334155);
+        scene.fog.color.set(0x475569);
+        scene.fog.density = 0.012;
+        hemiLight.color.set(0x64748b);
+        hemiLight.intensity = 0.45;
+        dirLight.color.set(0x94a3b8);
+        dirLight.intensity = 0.85;
+        if (rainParticles) rainParticles.visible = true;
+        if (sunSphere) sunSphere.visible = false;
+      }
+    }
+
+    function applyAmbiance(str) {
+      if (str.includes('Sunset') || str.includes('Golden')) setAmbiance('sunset');
+      else if (str.includes('Night')) setAmbiance('night');
+      else if (str.includes('Monsoon') || str.includes('Storm')) setAmbiance('storm');
+      else setAmbiance('day');
+    }
+
+    function toggleFullscreen() {
+      if (!document.fullscreenElement) {
+        wrap.requestFullscreen().catch(err => {});
+      } else {
+        document.exitFullscreen();
+      }
+    }
+
+    // -------------------------------------------------------------
+    // 18. RAYCASTING & CLICK-TO-INSPECT WELLHEADS
+    // -------------------------------------------------------------
+    function onMouseMove(event) {
+      const rect = wrap.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+
+      // Check well intersection for hover tooltip
+      if (wellGroup && wellGroup.visible) {
+        const intersects = raycaster.intersectObjects(wellGroup.children, true);
+        if (intersects.length > 0) {
+          let obj = intersects[0].object;
+          while (obj && !obj.userData.village && obj.parent) obj = obj.parent;
+          if (obj && obj.userData.village) {
+            tooltip.style.display = 'block';
+            tooltip.style.left = (event.clientX - rect.left + 12) + 'px';
+            tooltip.style.top = (event.clientY - rect.top - 10) + 'px';
+            tooltip.innerHTML = `<b>${obj.userData.village}</b><br>DTWL: ${obj.userData.dtwl.toFixed(2)} mbgl (${obj.userData.stress})`;
+            wrap.style.cursor = 'pointer';
+            return;
+          }
+        }
+      }
+      tooltip.style.display = 'none';
+      wrap.style.cursor = 'default';
+
+      // Sample ground GPS coordinates for live HUD
+      if (terrainMesh) {
+        const hits = raycaster.intersectObject(terrainMesh);
+        if (hits.length > 0) {
+          const p = hits[0].point;
+          const approxLat = CFG.lat - (p.z / 55.0) * 0.45;
+          const approxLon = CFG.lon + (p.x / 55.0) * 0.50;
+          const approxElev = CFG.elev + p.y * 14.0;
+          document.getElementById('mouse-coords').innerText = `📍 ${approxLat.toFixed(4)}°N, ${approxLon.toFixed(4)}°E | Elev: ${approxElev.toFixed(0)}m`;
+        }
+      }
+    }
+
+    function onCanvasClick(event) {
+      const rect = wrap.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      if (wellGroup && wellGroup.visible) {
+        const intersects = raycaster.intersectObjects(wellGroup.children, true);
+        if (intersects.length > 0) {
+          let obj = intersects[0].object;
+          while (obj && !obj.userData.village && obj.parent) obj = obj.parent;
+          if (obj && obj.userData.village) {
+            activeSelectedWell = obj.userData.village;
+            selectedWellCoords = {
+              x: obj.position.x,
+              y: sampleRegionalElevation(obj.position.x, obj.position.z),
+              z: obj.position.z
+            };
+            updateInspectorPanel(obj.userData);
+          }
+        }
+      }
+    }
+
+    function updateInspectorPanel(data) {
+      document.getElementById('ins-village').innerText = data.village;
+      document.getElementById('ins-geo').innerText = `${data.district || CFG.district} (${data.block || CFG.block})`;
+      document.getElementById('ins-coords').innerText = `${data.lat.toFixed(4)}°N, ${data.lon.toFixed(4)}°E`;
+      document.getElementById('ins-elev').innerText = `${data.elev.toFixed(1)} m ASL`;
+      document.getElementById('ins-dtwl').innerText = `${data.dtwl.toFixed(2)} mbgl`;
+      const wtElev = (data.elev - data.dtwl).toFixed(1);
+      document.getElementById('ins-wtelev').innerText = `${wtElev} m ASL`;
+      document.getElementById('ins-trend').innerText = `${data.trend >= 0 ? '+' : ''}${data.trend.toFixed(3)} mbgl/yr`;
+      const badge = document.getElementById('ins-badge');
+      badge.innerText = data.stress || 'Safe';
+      badge.style.background = data.color || '#10b981';
+    }
+
+    function onWindowResize() {
+      const w = wrap.clientWidth;
+      const h = wrap.clientHeight;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    }
+  </script>
+</body>
+</html>
+"""
+
+
+def _render_threejs_desert_twin(
+    season: str,
+    year: int,
+    district: str,
+    block: str,
+    selected_village: str,
+    mode: str,
+    state: dict[str, float | None],
+    asset_info: dict[str, Any],
+    asset_catalog: pd.DataFrame | None = None,
+    initial_preset: str = "📐 Elevated Isometric View (Default)",
+    initial_cutaway: str = "Complete Surface Landscape",
+    initial_exaggeration: float = 1.5,
+    initial_ambiance: str = "☀️ High Noon Thar Sun",
+) -> None:
+    """Render a photorealistic, real-time interactive 3D WebGL 50 km Regional Hydrological Digital Twin via Three.js.
+
+    Architectural Systems:
+    - 50 km Radius Regional Multi-Scale Georeferenced Landscape (150-unit world radius, ~7,854 km² circular coverage)
+    - Realistic regional geomorphology: Aravalli metamorphic strike ridges, central alluvial pediments, Thar aeolian dunefields
+    - Dynamic flowing Luni river network (Saraswati/Sagarmati confluence to SW) with animated normal ripples and concrete girder bridge
+    - Populated Rajasthani rural settlements (Govindgarh, Pushkar, Pisangan, Srinagar, Saradhna) with stepwells (Baori), Chhatris, and Kunds
+    - Agricultural cadastral field mosaic with solar tube-well pump houses and South-facing solar PV pumping arrays
+    - Natural xerophytic flora: Instanced Khejri trees (Prosopis cineraria), Rohida (Tecomella undulata), and Sewan grass (Lasiurus scindicus)
+    - 6-Layer Subsurface 3D Geological Stratigraphy Block (Topsoil, Vadose Murrum, Fractured Quartzite, Luni Aquifer, Aquitard, Malani Granite Basement)
+    - 400 Animated 3D Darcy Flow Particles tracking regional groundwater hydraulic gradient from NE to SW
+    - Real WGS84 Monitoring Wells with borehole casings, telemetry masts, status-coded beacons, and click-to-inspect raycaster
+    - Elevated Isometric Camera default (~35° downward pitch) + 10 smooth camera presets, rotating compass rose, scale bar, and GPS inspector
+    - Dynamic atmosphere: PCF soft shadows, 4 ambiance modes (Day, Sunset, Night, Monsoon Storm), drifting cloud shadows, and rain simulation
+    """
+    dtwl_val = float(state.get("dtwl") or 15.0)
+    rain_val = float(state.get("rainfall") or 0.0)
+    et_val = float(state.get("et") or 0.0)
+    soil_val = float(state.get("soil") or 14.0)
+    stress_cat = (asset_info.get("stress_status") or {}).get("category", "Safe")
+    stress_color = (asset_info.get("stress_status") or {}).get("color", "#10b981")
+    well_name = str(asset_info.get("name", "Basin Wellhead"))
+    well_lat = float(asset_info.get("latitude") or 26.45)
+    well_lon = float(asset_info.get("longitude") or 74.63)
+    well_elev = float(asset_info.get("elevation_m") or 480.0)
+
+    # Format all well records from asset_catalog for the Three.js scene
+    well_records: list[dict[str, Any]] = []
+    if asset_catalog is not None and not asset_catalog.empty:
+        for _, r in asset_catalog.iterrows():
+            v_name = str(r.get("Village", "Well"))
+            well_records.append({
+                "village": v_name,
+                "district": str(r.get("District", district)),
+                "block": str(r.get("Block", block)),
+                "lat": float(r.get("Latitude") or well_lat),
+                "lon": float(r.get("Longitude") or well_lon),
+                "elev": float(r.get("Elevation_m") or well_elev),
+                "dtwl": float(r.get("DTWL_mbgl") or dtwl_val),
+                "stress": str(r.get("Stress_Category", "Safe")),
+                "color": str(r.get("Stress_Color", "#10b981")),
+                "trend": float(r.get("Trend_Slope_mbgl_yr") or 0.0),
+                "obsCount": int(r.get("Observation_Count") or 12),
+                "minDtwl": float(r.get("Min_DTWL_mbgl") or (dtwl_val - 4.0)),
+                "maxDtwl": float(r.get("Max_DTWL_mbgl") or (dtwl_val + 6.0)),
+                "meanDtwl": float(r.get("Mean_DTWL_mbgl") or dtwl_val),
+                "isSelected": (v_name == selected_village),
+            })
+
+    config_json = json.dumps({
+        "season": season,
+        "year": year,
+        "district": district,
+        "block": block,
+        "selectedVillage": well_name,
+        "mode": mode,
+        "dtwl": round(dtwl_val, 2),
+        "rainfall": round(rain_val, 1),
+        "et": round(et_val, 1),
+        "soil": round(soil_val, 1),
+        "stressCat": stress_cat,
+        "stressColor": stress_color,
+        "lat": round(well_lat, 4),
+        "lon": round(well_lon, 4),
+        "elev": round(well_elev, 1),
+        "wells": well_records,
+        "initialPreset": initial_preset,
+        "initialCutaway": initial_cutaway,
+        "initialExaggeration": float(initial_exaggeration),
+        "initialAmbiance": initial_ambiance,
+    })
+
+    raw_template = _get_threejs_regional_template()
+    replacements = {
+        "__CONFIG_JSON__": config_json,
+        "__STRESS_COLOR__": stress_color,
+        "__STRESS_CAT__": stress_cat,
+        "__WELL_NAME__": well_name,
+        "__DISTRICT__": district,
+        "__BLOCK__": block,
+        "__WELL_LAT__": f"{well_lat:.4f}",
+        "__WELL_LON__": f"{well_lon:.4f}",
+        "__WELL_ELEV__": f"{well_elev:.1f}",
+        "__MODE__": mode,
+        "__DTWL_VAL__": f"{dtwl_val:.2f}",
+        "__WT_ELEV__": f"{(well_elev - dtwl_val):.1f}",
+        "__EXAGGERATION__": f"{float(initial_exaggeration):.1f}",
+    }
+    rendered_html = raw_template
+    for k, v in replacements.items():
+        rendered_html = rendered_html.replace(k, str(v))
+
+    components.html(rendered_html, height=760)
+
+
+
+def _metric_cards(
+    state: dict[str, float | None],
+    baseline: dict[str, float | None] | None = None,
+    mode: str = "Observed",
+) -> None:
+    """Render 8 synchronized hydrogeological KPI cards with live scenario deltas."""
+    metrics = [
+        ("Groundwater depth", "dtwl", "mbgl", "inverse"),
+        ("Rainfall", "rainfall", "mm", "normal"),
+        ("Evapotranspiration", "et", "mm", "inverse"),
+        ("Soil moisture", "soil", "%", "normal"),
+        ("NDVI (Vegetation)", "ndvi", "", "normal"),
+        ("NDWI (Water Index)", "ndwi", "", "normal"),
+        ("Water balance (P − ET)", "balance", "mm", "normal"),
+        ("GW stress ratio", "stress", "", "inverse"),
+    ]
+    for row in (metrics[:4], metrics[4:]):
+        cols = st.columns(4)
+        for col, (label, key, unit, delta_color) in zip(cols, row):
+            val = state.get(key)
+            val_str = _number(val, 2)
+            if unit and val_str != "Not available":
+                val_str = f"{val_str} {unit}"
+            delta_str = None
+            if mode in ("Simulated", "Forecast") and baseline and baseline.get(key) is not None and val is not None:
+                diff = float(val) - float(baseline[key])
+                if abs(diff) > 1e-3:
+                    delta_str = f"{diff:+.2f} {unit}".strip()
+            with col:
+                st.metric(
+                    label,
+                    val_str,
+                    delta=delta_str,
+                    delta_color=delta_color if delta_str else "off",
+                    border=True,
+                )
+
+
+def _render_asset_inspector(
+    asset_info: dict[str, Any],
+    result: dict[str, Any],
+    sim_output: dict[str, Any] | None,
+    mode: str,
+) -> None:
+    """Render the interactive Asset Inspector panel with historical series, forecast & vadose profile."""
+    stress = asset_info.get("stress_status", {})
+    lat_v = asset_info.get("latitude")
+    lon_v = asset_info.get("longitude")
+    elev_v = asset_info.get("elevation_m")
+    coords_str = (
+        f"{lat_v:.4f}°N, {lon_v:.4f}°E"
+        if lat_v is not None and lon_v is not None
+        else "Basin-level (no point coordinates)"
+    )
+    elev_str = f"{elev_v:.1f} m ASL" if elev_v is not None else "Not specified"
+    slope = float(asset_info.get("trend_slope_mbgl_yr") or 0.0)
+    trend_label = (
+        f"+{slope:.2f} mbgl/yr (Depleting)"
+        if slope > 0.05
+        else (f"{slope:.2f} mbgl/yr (Recovering)" if slope < -0.05 else f"{slope:+.2f} mbgl/yr (Stable)")
+    )
+
+    st.markdown(
+        f"""
+        <div class="twin-asset-card">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px;">
+            <div>
+              <div style="font-size:11px;font-weight:700;color:#0369a1;letter-spacing:.1em;text-transform:uppercase;">
+                SELECTED DIGITAL TWIN ASSET · {asset_info.get('type', 'Monitoring Asset')}
+              </div>
+              <div style="font-size:20px;font-weight:800;color:#0f172a;margin-top:2px;">
+                {asset_info.get('name')}
+              </div>
+              <span class="twin-usd-path">{asset_info.get('usd_path')}</span>
+            </div>
+            <div style="padding:6px 12px;border-radius:999px;background:{stress.get('bg', '#f1f5f9')};border:1px solid {stress.get('color', '#64748b')};color:{stress.get('color', '#334155')};font-weight:700;font-size:12px;">
+              {stress.get('badge', 'Status')}
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:10px;margin-top:14px;font-size:12.5px;color:#334155;">
+            <div><b>District / Block:</b><br>{asset_info.get('district')} · {asset_info.get('block')}</div>
+            <div><b>WGS84 Coordinates:</b><br>{coords_str}</div>
+            <div><b>Surface Elevation:</b><br>{elev_str}</div>
+            <div><b>Historical Range ({asset_info.get('year_range')}):</b><br>{_number(asset_info.get('historical_min_dtwl'))} – {_number(asset_info.get('historical_max_dtwl'))} mbgl (Mean: {_number(asset_info.get('historical_mean_dtwl'))})</div>
+            <div><b>Long-Term Rate:</b><br>{trend_label}</div>
+            <div><b>Verified Records:</b><br>{asset_info.get('observation_count')} seasonal observations</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    alerts = asset_info.get("alerts") or []
+    for alert_msg in alerts:
+        st.warning(f"⚠️ **{alert_msg}**")
+
+    hist_df: pd.DataFrame = asset_info.get("history_df", pd.DataFrame())
+    if not hist_df.empty and "YEAR" in hist_df.columns and TARGET in hist_df.columns:
+        c_chart1, c_chart2 = st.columns([3, 2], gap="medium")
+        with c_chart1:
+            fig_ts = go.Figure()
+            fig_ts.add_trace(
+                go.Scatter(
+                    x=hist_df["YEAR"],
+                    y=hist_df[TARGET],
+                    mode="lines+markers",
+                    name="Observed DTWL (mbgl)",
+                    line=dict(color="#0284c7", width=2.5),
+                    marker=dict(size=6),
+                )
+            )
+            # Highlight active selected year
+            act_yr = asset_info.get("active_year")
+            act_row = hist_df[hist_df["YEAR"] == act_yr]
+            if not act_row.empty:
+                fig_ts.add_trace(
+                    go.Scatter(
+                        x=act_row["YEAR"],
+                        y=act_row[TARGET],
+                        mode="markers",
+                        name=f"Selected Year ({act_yr})",
+                        marker=dict(size=12, color="#dc2626", symbol="diamond"),
+                    )
+                )
+
+            # Overlay forecast or simulated trajectory
+            if mode == "Simulated" and sim_output and "trajectory_df" in sim_output:
+                t_df = sim_output["trajectory_df"]
+                fig_ts.add_trace(
+                    go.Scatter(
+                        x=t_df["Year"],
+                        y=t_df["Baseline_Forecast_DTWL_mbgl"],
+                        mode="lines",
+                        line=dict(color="#64748b", dash="dot", width=2),
+                        name="Baseline Forecast",
+                    )
+                )
+                fig_ts.add_trace(
+                    go.Scatter(
+                        x=t_df["Year"],
+                        y=t_df["Forecast_DTWL_mbgl"],
+                        mode="lines+markers",
+                        line=dict(color="#d97706", width=2.5),
+                        name="Simulated Scenario Trajectory",
+                    )
+                )
+            else:
+                fc_df = result.get("forecast", pd.DataFrame())
+                if isinstance(fc_df, pd.DataFrame) and not fc_df.empty and "Scenario forecast DTWL (mbgl)" in fc_df.columns:
+                    fig_ts.add_trace(
+                        go.Scatter(
+                            x=fc_df["Year"],
+                            y=fc_df["Scenario forecast DTWL (mbgl)"],
+                            mode="lines+markers",
+                            line=dict(color="#7c3aed", dash="dash", width=2.2),
+                            name=f"Model Forecast ({result.get('best_model')})",
+                        )
+                    )
+
+            fig_ts.update_layout(
+                title=f"Historical & Projected Groundwater Trajectory — {asset_info.get('name')}",
+                xaxis_title="Year",
+                yaxis_title="DTWL (mbgl — higher is deeper)",
+                height=310,
+                margin=dict(l=16, r=16, t=38, b=16),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                legend=dict(orientation="h", y=-0.22),
+            )
+            st.plotly_chart(fig_ts, use_container_width=True, config={"displaylogo": False})
+
+        with c_chart2:
+            # Vadose zone profile or Rainfall vs ET bar comparison for this asset
+            if {"Rainfall", "ET"}.issubset(hist_df.columns):
+                fig_flux = go.Figure()
+                fig_flux.add_trace(
+                    go.Bar(x=hist_df["YEAR"], y=hist_df["Rainfall"], name="Rainfall (mm)", marker_color="#38bdf8")
+                )
+                fig_flux.add_trace(
+                    go.Bar(x=hist_df["YEAR"], y=hist_df["ET"], name="ET (mm)", marker_color="#f59e0b")
+                )
+                fig_flux.update_layout(
+                    title="Seasonal Rainfall vs. Evapotranspiration (mm)",
+                    xaxis_title="Year",
+                    yaxis_title="Flux (mm)",
+                    barmode="group",
+                    height=310,
+                    margin=dict(l=16, r=16, t=38, b=16),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    legend=dict(orientation="h", y=-0.22),
+                )
+                st.plotly_chart(fig_flux, use_container_width=True, config={"displaylogo": False})
+
+
+def render_digital_twin(payload: dict[str, Any]) -> None:
+    """Render the interactive, OpenUSD-inspired Hydrogeological Digital Twin workspace."""
+    _twin_style()
+    results: dict[str, dict[str, Any]] = payload["results"]
+
+    # Retrieve configurable water-stress thresholds from session state if set by Admin
+    admin_cfg = st.session_state.get("nayapani_admin_settings") or {}
+    stress_thresholds = (
+        float(admin_cfg.get("water_stress_safe_mbgl", 10.0)),
+        float(admin_cfg.get("water_stress_semi_critical_mbgl", 20.0)),
+        float(admin_cfg.get("water_stress_critical_mbgl", 35.0)),
+    )
+
+    controls, view = st.columns([1.08, 2.92], gap="large")
+
+    with controls:
+        st.markdown("#### 🎛️ Digital Twin Controls")
+        season_list = list(results.keys())
+        season = st.selectbox("Season", season_list, key="twin_season")
+        result = results[season]
+        source = result["lagged_data"].copy()
+
+        # Geographic Filtering (District & Block)
+        districts = (
+            ["All available"] + sorted(source["DISTRICT"].dropna().astype(str).unique().tolist())
+            if "DISTRICT" in source.columns and source["DISTRICT"].notna().any()
+            else ["All available"]
+        )
+        district = st.selectbox("District", districts, key="twin_district")
+
+        scope_df = source.copy()
+        if district != "All available" and "DISTRICT" in scope_df.columns:
+            sub_d = scope_df[scope_df["DISTRICT"].astype(str) == district]
+            if not sub_d.empty:
+                scope_df = sub_d
+
+        blocks = (
+            ["All available"] + sorted(scope_df["BLOCK"].dropna().astype(str).unique().tolist())
+            if "BLOCK" in scope_df.columns and scope_df["BLOCK"].notna().any()
+            else ["All available"]
+        )
+        block = st.selectbox("Administrative Block", blocks, key="twin_block")
+        if block != "All available" and "BLOCK" in scope_df.columns:
+            sub_b = scope_df[scope_df["BLOCK"].astype(str) == block]
+            if not sub_b.empty:
+                scope_df = sub_b
+
+        # Asset Selector (Basin Aggregate or Individual Village Monitoring Well)
+        villages = sorted(scope_df["VILLAGE"].dropna().astype(str).unique().tolist())
+        asset_options = ["All villages (Basin Aggregate)"] + villages
+        selected_village = st.selectbox(
+            "Monitoring Well Asset",
+            asset_options,
+            key="twin_selected_asset",
+            help="Select an individual village monitoring well to inspect its coordinates, borehole depth, historical trend, and AI analysis.",
+        )
+
+        # Temporal Playback & Year Selection
+        years = sorted(pd.to_numeric(scope_df["YEAR"], errors="coerce").dropna().astype(int).unique().tolist())
+        if not years:
+            years = [2022]
+
+        if "twin_year_idx" not in st.session_state or st.session_state["twin_year_idx"] >= len(years):
+            st.session_state["twin_year_idx"] = len(years) - 1
+
+        st.markdown("##### ⏱️ Temporal Playback")
+        pb1, pb2, pb3, pb4 = st.columns(4)
+        if pb1.button("⏮", help="Jump to earliest observed year", use_container_width=True, key="twin_btn_first"):
+            st.session_state["twin_year_idx"] = 0
+        if pb2.button("◀", help="Step back one year", use_container_width=True, key="twin_btn_prev"):
+            st.session_state["twin_year_idx"] = max(0, st.session_state["twin_year_idx"] - 1)
+        if pb3.button("▶", help="Step forward one year", use_container_width=True, key="twin_btn_next"):
+            st.session_state["twin_year_idx"] = min(len(years) - 1, st.session_state["twin_year_idx"] + 1)
+        if pb4.button("⏭", help="Jump to latest observed year", use_container_width=True, key="twin_btn_last"):
+            st.session_state["twin_year_idx"] = len(years) - 1
+
+        selected_year_val = years[st.session_state["twin_year_idx"]]
+        year = st.selectbox(
+            "Observation Year",
+            years,
+            index=years.index(selected_year_val),
+            key="twin_year_select",
+        )
+        st.session_state["twin_year_idx"] = years.index(year)
+
+        # Operating State Mode
+        mode = st.segmented_control(
+            "State",
+            ["Observed", "Forecast", "Simulated"],
+            default="Observed",
+            key="twin_mode",
+        )
+        if not mode:
+            mode = "Observed"
+
+        fc_step_year = None
+        if mode == "Forecast":
+            fc_df_ctrl = result.get("forecast", pd.DataFrame())
+            if isinstance(fc_df_ctrl, pd.DataFrame) and not fc_df_ctrl.empty and "Year" in fc_df_ctrl.columns:
+                fc_years = fc_df_ctrl["Year"].astype(int).tolist()
+                fc_step_year = st.selectbox("Forecast Horizon Year", fc_years, index=0, key="twin_fc_year")
+
+        scenario_params = {
+            "rainfall_pct": 0.0,
+            "et_pct": 0.0,
+            "sm_delta": 0.0,
+            "temp_delta_c": 0.0,
+            "ndvi_delta": 0.0,
+            "pumping_factor": 1.0,
+        }
+        selected_preset = "Baseline (Zero Perturbation)"
+
+        if mode == "Simulated":
+            st.markdown("##### 🧪 Coupled Scenario Simulator")
+            selected_preset = st.selectbox(
+                "Scenario Preset",
+                list(SCENARIO_PRESETS.keys()),
+                index=2,
+                key="twin_scenario_preset",
+            )
+            preset_defaults = SCENARIO_PRESETS[selected_preset]
+            st.caption(preset_defaults["description"])
+
+            if selected_preset == "Custom Parameter Configuration":
+                with st.form("twin_simulation_form", border=False):
+                    scenario_params["rainfall_pct"] = st.slider(
+                        "Rainfall perturbation (%)", -60.0, 100.0, 0.0, 5.0
+                    )
+                    scenario_params["et_pct"] = st.slider(
+                        "Evapotranspiration perturbation (%)", -40.0, 60.0, 0.0, 5.0
+                    )
+                    scenario_params["sm_delta"] = st.slider(
+                        "Soil moisture shift (%)", -20.0, 20.0, 0.0, 1.0
+                    )
+                    scenario_params["temp_delta_c"] = st.slider(
+                        "Temperature shift (°C)", -5.0, 8.0, 0.0, 0.5
+                    )
+                    scenario_params["ndvi_delta"] = st.slider(
+                        "NDVI shift", -0.25, 0.25, 0.0, 0.02
+                    )
+                    scenario_params["pumping_factor"] = st.slider(
+                        "Tube-well pumping factor (x)", 0.50, 2.00, 1.00, 0.05
+                    )
+                    st.form_submit_button("Execute Coupled Simulation", type="primary", use_container_width=True)
+            else:
+                scenario_params = {
+                    k: float(v) for k, v in preset_defaults.items() if k != "description"
+                }
+
+        st.markdown("##### 🎥 3D Camera, Subsurface & Layers")
+        camera_preset = st.selectbox(
+            "Camera Viewpoint",
+            [
+                "📐 Elevated Isometric View (Default)",
+                "🌐 Basin Overview",
+                "🛰️ Top-Down GIS View",
+                "🌄 Low Oblique Landscape View",
+                "🪓 Groundwater Cutaway View",
+                "🔬 Geological Cross-Section View",
+                "🎯 Monitoring Well Focus",
+                "🔄 Free Orbit View",
+                "⏮ Reset Camera",
+                "📐 Fit to Terrain",
+            ],
+            key="twin_camera_preset",
+            help="Select an elevated isometric perspective or specialized scientific camera view.",
+        )
+        cutaway_mode = st.selectbox(
+            "Geological Cutaway Mode",
+            [
+                "Complete Surface Landscape",
+                "Surface + Partially Exposed Underground",
+                "Full Geological Cutaway",
+                "Vertical Geological Cross-Section",
+                "Groundwater-Only Visualization",
+                "Combined Surface & Subsurface View",
+            ],
+            key="twin_cutaway_mode",
+            help="Select how subsurface hydrogeology and the water table are exposed.",
+        )
+        vertical_exaggeration = st.slider(
+            "Vertical Terrain Exaggeration",
+            1.0, 3.5, 1.5, 0.25,
+            key="twin_vertical_exaggeration",
+            help="Amplify vertical relief to accentuate subtle sand dunes and hydrogeological strata.",
+        )
+        desert_ambiance = st.selectbox(
+            "Desert Sun & Atmospheric Ambiance",
+            [
+                "☀️ High Noon Thar Sun",
+                "🌅 Sunset / Golden Hour in Thar",
+                "🌌 Starry Thar Desert Night",
+            ],
+            key="twin_desert_ambiance",
+            help="Switch between brilliant noon sun, glowing sunset over dunes, or starlit desert night with illuminated aquifer.",
+        )
+
+        layer_names = [
+            "Terrain (Thar Sand Dunes)",
+            "Luni Ephemeral Riverbed & Saline Flats",
+            "Aquifer Water Table",
+            "Wells (Piezometer Telemetry Stations)",
+            "Borehole Columns",
+            "Desert Flora (Khejri Trees & Sewan Grass)",
+            "Traditional Thar Water Harvesting (Khadins)",
+            "Rainfall Flux",
+            "ET Flux",
+            "Groundwater Flow Streamlines",
+            "Subsurface Stratigraphy",
+        ]
+        with st.expander("Scene Layer Visibility", expanded=False):
+            layers = {
+                name: st.checkbox(name, value=True, key=f"twin_layer_{name}")
+                for name in layer_names
+            }
+
+    # Filter data for the active year & selected asset
+    year_slice = scope_df.loc[pd.to_numeric(scope_df["YEAR"], errors="coerce").eq(year)].copy()
+    if year_slice.empty:
+        year_slice = scope_df.copy()
+
+    if selected_village != "All villages (Basin Aggregate)":
+        asset_slice = year_slice[year_slice["VILLAGE"].astype(str) == selected_village].copy()
+        if asset_slice.empty:
+            asset_slice = scope_df[scope_df["VILLAGE"].astype(str) == selected_village].copy()
+    else:
+        asset_slice = year_slice.copy()
+
+    baseline_state: dict[str, float | None] = {
+        "dtwl": mean_col(asset_slice, TARGET),
+        "rainfall": mean_col(asset_slice, "Rainfall"),
+        "et": mean_col(asset_slice, "ET"),
+        "soil": mean_col(asset_slice, "Avg_SM") or mean_col(asset_slice, "SM_10cm"),
+        "ndvi": mean_col(asset_slice, "NDVI"),
+        "ndwi": mean_col(asset_slice, "NDWI"),
+        "balance": mean_col(asset_slice, "Water_Balance"),
+        "stress": mean_col(asset_slice, "GW_Stress"),
+    }
+    state = dict(baseline_state)
+    sim_output: dict[str, Any] | None = None
+    provenance_badge = PROVENANCE_OBSERVED
+
+    if mode == "Forecast":
+        provenance_badge = PROVENANCE_FORECAST
+        fc = result.get("forecast", pd.DataFrame())
+        col_fc = "Scenario forecast DTWL (mbgl)"
+        if isinstance(fc, pd.DataFrame) and not fc.empty and col_fc in fc.columns:
+            if fc_step_year is not None and "Year" in fc.columns:
+                match_fc = fc[fc["Year"].astype(int) == int(fc_step_year)]
+                fc_base_val = float(match_fc[col_fc].iloc[0]) if not match_fc.empty else float(fc[col_fc].iloc[0])
+            else:
+                fc_base_val = float(fc[col_fc].iloc[0])
+            # Preserve spatial offset if a specific village well is selected
+            basin_mean_obs = mean_col(year_slice, TARGET) or fc_base_val
+            village_offset = (baseline_state["dtwl"] - basin_mean_obs) if baseline_state["dtwl"] is not None else 0.0
+            state["dtwl"] = max(0.2, fc_base_val + village_offset)
+        else:
+            st.warning("MODEL DATA UNAVAILABLE — this season has no saved forecast artifact.")
+
+    elif mode == "Simulated":
+        provenance_badge = PROVENANCE_SIMULATED
+        sim_output = run_coupled_simulation(
+            result=result,
+            filtered_rows=asset_slice,
+            scenario_params=scenario_params,
+        )
+        if sim_output and "simulated" in sim_output:
+            for k in state:
+                if k in sim_output["simulated"]:
+                    state[k] = sim_output["simulated"][k]
+            log_twin_scenario_change("active_user", selected_preset, scenario_params, sim_output)
+
+    # Build Asset Catalog & Inspect Selected Asset
+    asset_catalog = build_asset_catalog(
+        season_df=scope_df,
+        year=year,
+        district=district,
+        block=block,
+        stress_thresholds=stress_thresholds,
+    )
+    asset_info = inspect_selected_asset(
+        season_df=scope_df,
+        asset_catalog=asset_catalog,
+        selected_village=selected_village,
+        active_year=fc_step_year if (mode == "Forecast" and fc_step_year) else year,
+        active_metrics=state,
+        mode=mode,
+        stress_thresholds=stress_thresholds,
+    )
+
+    has_real_coords = (
+        {"LATITUDE", "LONGITUDE"}.issubset(year_slice.columns)
+        and year_slice[["LATITUDE", "LONGITUDE"]].notna().all(axis=1).any()
+    )
+    has_real_elev = "Elevation" in year_slice.columns and year_slice["Elevation"].notna().any()
+
+    usd_hierarchy = build_openusd_scene_hierarchy(
+        season=season,
+        year=fc_step_year if (mode == "Forecast" and fc_step_year) else year,
+        district=district,
+        mode=mode,
+        state_metrics=state,
+        asset_info=asset_info,
+        has_real_coords=has_real_coords,
+        has_real_elevation=has_real_elev,
+        layers=layers,
+    )
+
+    # Synchronize Central Digital Twin State for RAG Assistant & Global Components
+    st.session_state["digital_twin_state"] = {
+        "season": season,
+        "year": fc_step_year if (mode == "Forecast" and fc_step_year) else year,
+        "base_year": year,
+        "district": district,
+        "block": block,
+        "selected_asset": selected_village,
+        "asset_info": {k: v for k, v in asset_info.items() if k != "history_df"},
+        "mode": mode,
+        "provenance": provenance_badge,
+        "scenario_preset": selected_preset if mode == "Simulated" else "None",
+        "scenario_params": scenario_params if mode == "Simulated" else {},
+        "state": state,
+        "baseline_state": baseline_state,
+        "simulation_summary": {
+            "deltas": sim_output.get("deltas", {}),
+            "model_outputs": sim_output.get("model_outputs", {}),
+            "assumptions": sim_output.get("assumptions", {}),
+        } if sim_output else None,
+        "best_model": result.get("best_model"),
+        "deep_best_model": result.get("deep_best_model"),
+        "has_real_coords": has_real_coords,
+        "has_real_elevation": has_real_elev,
+    }
+
+    # Top Header Banner with Provenance & OpenUSD Stage Status
+    geom_badge = (
+        "WGS84 Coordinates + DEM Elevation Active"
+        if (has_real_coords and has_real_elev)
+        else ("WGS84 Well Coordinates Active" if has_real_coords else PROVENANCE_ILLUSTRATIVE)
+    )
+    st.markdown(
+        f"""
+        <div class="twin-shell">
+          <div class="twin-kicker">NAYA-PANI · INTERACTIVE HYDROGEOLOGICAL DIGITAL TWIN</div>
+          <div class="twin-title">Synchronized Subsurface, Simulation & RAG Intelligence</div>
+          <p class="twin-copy">
+            Data-bound 3D hydrogeological representation synchronized with seasonal ML/DL models,
+            vadose-aquifer water-balance equations, monitoring well assets, and the evidence-grounded AI assistant.
+          </p>
+          <div class="twin-badges">
+            <span class="twin-status">● STAGE ACTIVE: /World/RajasthanBasin</span>
+            <span class="twin-prov-badge">📊 Data Mode: {provenance_badge}</span>
+            <span class="twin-prov-badge">🗺️ Geometry: {geom_badge}</span>
+            <span class="twin-prov-badge">🎯 Asset: {asset_info.get('name')}</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with view:
+        label = {
+            "Observed": "VERIFIED OBSERVED STATE",
+            "Forecast": f"RECURSIVE MODEL FORECAST ({fc_step_year or year})",
+            "Simulated": f"COUPLED SCENARIO SIMULATION — {selected_preset}",
+        }[mode]
+        st.markdown(
+            f"<div class='twin-panel'><b>{label}</b><br>"
+            f"<span class='twin-note'>Season: <b>{season}</b> · Year: <b>{fc_step_year if (mode == 'Forecast' and fc_step_year) else year}</b> · "
+            f"District: <b>{district}</b> · Block: <b>{block}</b> · Selected Asset: <b>{asset_info.get('name')}</b></span></div>",
+            unsafe_allow_html=True,
+        )
+        view_tabs = st.tabs([
+            "🎮 Cinematic 3D Desert Twin (Real-Time Three.js Engine)",
+            "📊 Scientific Hydrogeological Stage (Plotly WebGL)",
+        ])
+        with view_tabs[0]:
+            _render_threejs_desert_twin(
+                season=season,
+                year=fc_step_year if (mode == "Forecast" and fc_step_year) else year,
+                district=district,
+                block=block,
+                selected_village=selected_village,
+                mode=mode,
+                state=state,
+                asset_info=asset_info,
+                asset_catalog=asset_catalog,
+                initial_preset=camera_preset,
+                initial_cutaway=cutaway_mode,
+                initial_exaggeration=vertical_exaggeration,
+                initial_ambiance=desert_ambiance,
+            )
+        with view_tabs[1]:
+            scene_fig = _scene(
+                frame=year_slice,
+                state=state,
+                layers=layers,
+                selected_village=selected_village,
+                camera_preset=camera_preset,
+                baseline_dtwl=baseline_state.get("dtwl"),
+                mode=mode,
+                stress_thresholds=stress_thresholds,
+                ambiance=desert_ambiance,
+                exaggeration=vertical_exaggeration,
+                cutaway_mode=cutaway_mode,
+            )
+            st.plotly_chart(
+                scene_fig,
+                key="digital_twin_scene",
+                use_container_width=True,
+                config={"displaylogo": False, "scrollZoom": True},
+            )
+
+    # 8 Synchronized Hydrogeological KPI Cards with Deltas
+    _metric_cards(state, baseline=baseline_state, mode=mode)
+
+    # Simulated Mode: Before-vs-After Comparison & Coupled Model Breakdown
+    if mode == "Simulated" and sim_output:
+        st.markdown("#### 🔬 Coupled Simulation Breakdown (Before vs. After & Multi-Model Response)")
+        m_out = sim_output["model_outputs"]
+        deltas = sim_output["deltas"]
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        sc1.metric(
+            "Baseline Observed DTWL",
+            f"{_number(baseline_state.get('dtwl'))} mbgl",
+            border=True,
+        )
+        sc2.metric(
+            f"ML Model ({m_out.get('best_ml_model')})",
+            f"{_number(m_out.get('ml_simulated_dtwl'))} mbgl",
+            delta=f"{deltas.get('ml_dtwl_delta', 0.0):+.2f} mbgl",
+            delta_color="inverse",
+            border=True,
+        )
+        sc3.metric(
+            f"Deep/PINN ({m_out.get('best_deep_model')})",
+            f"{_number(m_out.get('deep_simulated_dtwl'))} mbgl" if m_out.get("deep_simulated_dtwl") is not None else "Not enabled",
+            delta=f"{deltas.get('deep_dtwl_delta', 0.0):+.2f} mbgl" if m_out.get("deep_simulated_dtwl") is not None else None,
+            delta_color="inverse",
+            border=True,
+        )
+        sc4.metric(
+            "Coupled Twin DTWL (95% CI)",
+            f"{_number(m_out.get('coupled_dtwl'))} mbgl",
+            delta=f"{deltas.get('dtwl', 0.0):+.2f} mbgl ([{_number(m_out.get('lower_95_ci'))}–{_number(m_out.get('upper_95_ci'))}])",
+            delta_color="inverse",
+            border=True,
+        )
+
+        for v_notice in sim_output.get("validation_notices", []):
+            if v_notice.severity in ("WARNING", "CRITICAL"):
+                st.warning(f"🛡️ **Physical Bound Notice ({v_notice.category})**: {v_notice.message}")
+
+        # Sustainable Water-Budget Capacity Planner (inspired by NVIDIA fixed-budget capacity analysis)
+        base_d = baseline_state.get("dtwl") or 10.0
+        p_factor = float(scenario_params.get("pumping_factor", 1.0))
+        r_deficit = float(scenario_params.get("rainfall_pct", 0.0))
+        budget = calculate_sustainable_water_budget(
+            baseline_dtwl_mbgl=base_d,
+            current_pumping_factor=p_factor,
+            rainfall_deficit_pct=r_deficit,
+            critical_threshold_mbgl=stress_thresholds[1],
+        )
+        with st.expander("⚖️ Sustainable Water-Budget Capacity Planner (Fixed Recharge Analysis)", expanded=True):
+            st.caption(
+                "Calculates the maximum sustainable tube-well pumping before the aquifer tips into Critical stress, "
+                "alongside Managed Aquifer Recharge (MAR / check-dam) requirements to offset seasonal drought."
+            )
+            b_c1, b_c2, b_c3 = st.columns(3)
+            b_c1.metric("Aquifer Depth Headroom", f"{budget['headroom_to_critical_m']} m", f"Drought Penalty: -{budget['drought_drawdown_penalty_m']} m")
+            b_c2.metric("Max Sustainable Pumping", f"{budget['max_sustainable_pumping_factor']}x", f"Status: {budget['status']}")
+            b_c3.metric(
+                "MAR Recharge Needed",
+                f"{budget['mar_recharge_needed_mcm']} MCM",
+                f"Pumping Cut: -{budget['pumping_reduction_needed_pct']}%" if budget["pumping_reduction_needed_pct"] > 0 else "Safe Buffer",
+            )
+
+    # Interactive Selected Asset Inspector Panel
+    st.markdown("#### 🔍 Selected Asset Inspector & Historical Trajectory")
+    _render_asset_inspector(
+        asset_info=asset_info,
+        result=result,
+        sim_output=sim_output,
+        mode=mode,
+    )
+
+    # OpenUSD Scene Hierarchy & Monitoring Well Asset Catalog Tabs
+    tab_copilot, tab_catalog, tab_usd, tab_perf = st.tabs([
+        "🤖 Digital Twin AI Copilot (RAG-Connected)",
+        "📍 Monitoring Well Asset Catalog",
+        "🗂️ OpenUSD Scene Hierarchy & Provenance",
+        "📊 Model Performance & LOFO Sensitivity",
+    ])
+
+    with tab_copilot:
+        st.markdown("##### Context-Aware Digital Twin Assistant")
+        st.caption(
+            f"Synchronized with **{asset_info.get('name')}** · **{season} {fc_step_year if (mode == 'Forecast' and fc_step_year) else year}** · "
+            f"Mode: **{mode}** ({provenance_badge}). Answers combine live Digital Twin state, structured calculations, and retrieved documentation."
+        )
+
+        if "rag_history" not in st.session_state:
+            st.session_state["rag_history"] = []
+
+        # Quick Context-Aware Prompt Pills
+        q_col1, q_col2, q_col3, q_col4 = st.columns(4)
+        quick_q: str | None = None
+        if q_col1.button("Explain selected asset condition", use_container_width=True, key="twin_q1"):
+            quick_q = f"Explain the current condition and water-stress status of {asset_info.get('name')} in {season} {year}."
+        if q_col2.button("Analyze historical change & trend", use_container_width=True, key="twin_q2"):
+            quick_q = f"How has groundwater depth at {asset_info.get('name')} changed historically in {season}, and what is its long-term trend?"
+        if q_col3.button("Evaluate current scenario impact", use_container_width=True, key="twin_q3"):
+            quick_q = f"What happens to groundwater depth, water balance, and stress in {season} under the current {mode} state?"
+        if q_col4.button("Key physical drivers & LOFO", use_container_width=True, key="twin_q4"):
+            quick_q = f"What are the top LOFO feature importance drivers for {season}?"
+
+        custom_twin_q = st.chat_input(
+            f"Ask about {asset_info.get('name')}, scenario impacts, measurements, or methodology…",
+            key="twin_inline_chat_input",
+        )
+        active_question = quick_q or custom_twin_q
+
+        if active_question:
+            clean_q, sec_notices = sanitize_rag_prompt(active_question)
+            for notice in sec_notices:
+                if notice.severity == "CRITICAL":
+                    st.warning(f"🛡️ Security Guard ({notice.category}): {notice.message}")
+            prior_history = list(st.session_state["rag_history"])
+            with st.spinner("Synthesizing Digital Twin state, structured metrics, and knowledge base…"):
+                res_rag = rag_answer(
+                    clean_q,
+                    payload,
+                    history=prior_history,
+                    twin_state=st.session_state.get("digital_twin_state"),
+                )
+                ans_clean = sanitize_rag_response(res_rag["answer"])
+            st.session_state["rag_history"].extend([
+                {"role": "user", "content": clean_q, "sources": [], "provenance": []},
+                {
+                    "role": "assistant",
+                    "content": ans_clean,
+                    "sources": res_rag.get("sources", []),
+                    "provenance": res_rag.get("provenance", []),
+                },
+            ])
+
+        for turn in st.session_state["rag_history"][-6:]:
+            with st.chat_message(turn["role"]):
+                st.markdown(turn["content"])
+                meta_parts = []
+                if turn.get("provenance"):
+                    meta_parts.append("Provenance: " + " · ".join(turn["provenance"]))
+                if turn.get("sources"):
+                    meta_parts.append("Sources: " + ", ".join(turn["sources"]))
+                if meta_parts:
+                    st.caption(" | ".join(meta_parts))
+
+        # Also keep the "Ask Twin in Full AI Assistant Page" button working seamlessly
+        context_prompt = (
+            f"Digital Twin context: {label}; asset {asset_info.get('name')}; season {season}; "
+            f"year {fc_step_year if (mode == 'Forecast' and fc_step_year) else year}; district {district}; "
+            f"groundwater depth {_number(state['dtwl'])} mbgl ({asset_info.get('stress_status', {}).get('category')}); "
+            f"rainfall {_number(state['rainfall'])} mm; ET {_number(state['et'])} mm; "
+            f"best model {result['best_model']}. Explain this current Digital Twin state using project evidence only."
+        )
+
+        def _send_to_main_assistant() -> None:
+            history = st.session_state.get("rag_history", [])
+            res_main = rag_answer(
+                context_prompt,
+                payload,
+                history=history,
+                twin_state=st.session_state.get("digital_twin_state"),
+            )
+            st.session_state["rag_history"] = history + [
+                {"role": "user", "content": context_prompt, "sources": []},
+                {
+                    "role": "assistant",
+                    "content": sanitize_rag_response(res_main["answer"]),
+                    "sources": res_main.get("sources", []),
+                },
+            ]
+            st.session_state["main_nav"] = "AI Assistant"
+
+        st.button(
+            "Ask Twin in Full AI Assistant",
+            icon=":material/psychology:",
+            key="ask_twin",
+            on_click=_send_to_main_assistant,
+        )
+
+    with tab_catalog:
+        st.markdown("##### Spatial Monitoring Well Asset Catalog")
+        if not asset_catalog.empty:
+            display_cols = [
+                "Asset_ID",
+                "Village",
+                "District",
+                "Block",
+                "Latitude",
+                "Longitude",
+                "Elevation_m",
+                "DTWL_mbgl",
+                "Historical_Mean_DTWL",
+                "Trend_Slope_mbgl_yr",
+                "Stress_Badge",
+                "Rainfall_mm",
+                "ET_mm",
+                "Observations_Count",
+                "Year_Range",
+            ]
+            st.dataframe(
+                asset_catalog[[c for c in display_cols if c in asset_catalog.columns]],
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("No monitoring well assets found for the selected filter.")
+
+    with tab_usd:
+        st.markdown("##### OpenUSD Scene Graph & SimReady Data Provenance")
+        st.caption(
+            "Every visual and physical element in the Digital Twin is mapped to an OpenUSD scene-graph prim "
+            "with SimReady metadata and verifiable data provenance (following the NVIDIA Omniverse DSX Blueprint)."
+        )
+
+        usd_col1, usd_col2 = st.columns([2, 1])
+        with usd_col1:
+            st.dataframe(pd.DataFrame(usd_hierarchy), use_container_width=True, hide_index=True)
+        with usd_col2:
+            st.markdown("###### SimReady Asset Validation")
+            simready_report = validate_simready_hydro_assets(asset_catalog)
+            st.metric(
+                "SimReady Compliance",
+                f"{simready_report['compliance_pct']:.1f}%",
+                f"{simready_report['simready_compliant_count']} of {simready_report['total_assets']} Wells Verified",
+            )
+            tiers = simready_report.get("tier_summary", {})
+            st.caption(
+                f"• **Tier 1 (SimReady Full)**: {tiers.get('Tier 1 (SimReady Full)', 0)} wells\n"
+                f"• **Tier 2 (Geometry)**: {tiers.get('Tier 2 (Basic Geometry)', 0)} wells\n"
+                f"• **Tier 3 (Data Gaps)**: {tiers.get('Tier 3 (Incomplete)', 0)} wells"
+            )
+
+        st.markdown("---")
+        st.markdown("###### Export to NVIDIA Omniverse / OpenUSD (.usda Stage)")
+        st.caption(
+            "Generate an OpenUSD ASCII (`.usda`) stage with WGS84 coordinate metadata, "
+            "SimReady piezometers, and physical vadose/aquifer properties for simulation in NVIDIA Omniverse or USD View."
+        )
+        usda_content = export_openusd_stage(
+            season=season,
+            year=fc_step_year if (mode == "Forecast" and fc_step_year) else year,
+            district=district,
+            mode=mode,
+            state_metrics=state,
+            asset_catalog=asset_catalog,
+            asset_info=asset_info,
+            sim_result=sim_output,
+        )
+        usd_exp_col1, usd_exp_col2 = st.columns([1.5, 2.5])
+        with usd_exp_col1:
+            st.download_button(
+                "📥 Download OpenUSD Stage (.usda)",
+                data=usda_content.encode("utf-8"),
+                file_name=f"NayaPani_RajasthanBasin_{season}_{year}_{mode}.usda",
+                mime="model/vnd.usda",
+                type="primary",
+                use_container_width=True,
+            )
+        with usd_exp_col2:
+            with st.expander("Inspect OpenUSD ASCII (.usda) Code"):
+                st.code(usda_content[:1500] + "\n# ... (truncated for preview; download for full stage)", language="python")
+
+    with tab_perf:
+        left, right = st.columns([3, 2], gap="large")
+        with left:
+            st.markdown("##### Headline Model Performance")
+            top = result["metrics"].iloc[0]
+            performance_rows = [("Best model", str(top.get("Model", "Not available")))]
+            performance_rows.extend(
+                (lbl, _number(top.get(column, np.nan), 4))
+                for lbl, column in [
+                    ("Test R²", "Bias-corrected test R2"),
+                    ("RMSE (mbgl)", "Bias-corrected test RMSE"),
+                    ("MAE (mbgl)", "Bias-corrected test MAE"),
+                    ("KGE", "Bias-corrected test KGE"),
+                    ("NSE", "Bias-corrected test NSE"),
+                    ("Pearson r", "Bias-corrected test Pearson r"),
+                    ("Bias (mbgl)", "Bias-corrected test Bias"),
+                    ("Inference (ms/row)", "Test inference (ms/row)"),
+                ]
+            )
+            performance = pd.DataFrame(performance_rows, columns=["Metric", "Value"])
+            st.dataframe(performance, hide_index=True, use_container_width=True)
+            st.caption("Held-out, bias-corrected pipeline metrics. Missing artifacts are shown as Not available.")
+        with right:
+            st.markdown("##### Leave-One-Feature-Out (LOFO) Explainability")
+            lofo = result.get("lofo", pd.DataFrame())
+            if isinstance(lofo, pd.DataFrame) and not lofo.empty:
+                st.dataframe(lofo.head(6), hide_index=True, use_container_width=True)
+                st.caption("LOFO sensitivity output from the active seasonal pipeline.")
+            else:
+                st.caption(
+                    "Feature-importance data unavailable. Enable leave-one-feature-out sensitivity before running analysis."
+                )

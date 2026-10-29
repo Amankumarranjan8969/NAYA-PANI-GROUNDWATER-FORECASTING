@@ -32,3 +32,11 @@ you're curious about periodicities in the aggregated series.
 ### Explaining a term simply
 Just name the term — "explain R² simply" works fine — and I'll drop the
 jargon and use a plain analogy instead of the formal definition.
+
+### Understanding the Digital Twin
+The Digital Twin is a visual summary of the selected season and year, not a
+calibrated spatial or physics simulation. Ask about the Observed, Forecast,
+and Simulated states or about the conceptual layers. In Forecast mode, only
+groundwater depth is replaced with the first saved scenario-forecast value;
+rainfall and other displayed variables remain observed averages. Simulated
+adjustments change the display only and do not run a new model.

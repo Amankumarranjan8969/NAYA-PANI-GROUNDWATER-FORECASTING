@@ -1,0 +1,843 @@
+"""Generate photorealistic prototype for Naya Pani 50 km Regional Digital Twin."""
+import os
+
+html_content = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Photorealistic Thar Basin 50km Twin Prototype</title>
+  <style>
+    * { box-sizing: border-box; }
+    body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #070b14; color: #f8fafc; }
+    #desert-canvas-wrap { position: relative; width: 100%; height: 760px; overflow: hidden; background: #070b14; user-select: none; }
+    #three-canvas { width: 100%; height: 100%; display: block; }
+
+    /* Top Camera Toolbar */
+    .top-toolbar { position: absolute; top: 10px; left: 12px; right: 12px; display: flex; align-items: center; justify-content: space-between; gap: 8px; z-index: 20; pointer-events: none; }
+    .preset-bar { display: flex; align-items: center; gap: 4px; background: rgba(15, 23, 42, 0.92); backdrop-filter: blur(12px); padding: 5px 8px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.18); pointer-events: auto; }
+    .preset-btn { background: transparent; border: 1px solid transparent; color: #cbd5e1; padding: 5px 9px; border-radius: 6px; font-size: 11px; font-weight: 500; cursor: pointer; display: flex; align-items: center; gap: 4px; transition: all 0.2s; }
+    .preset-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
+    .preset-btn.active { background: #d97706; color: #fff; border-color: #f59e0b; font-weight: 600; box-shadow: 0 2px 10px rgba(217,119,6,0.4); }
+
+    .top-actions { display: flex; align-items: center; gap: 5px; pointer-events: auto; }
+    .action-btn { background: rgba(15, 23, 42, 0.92); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.18); color: #cbd5e1; padding: 5px 9px; border-radius: 6px; font-size: 11px; font-weight: 500; cursor: pointer; transition: all 0.2s; }
+    .action-btn:hover { background: #334155; color: #fff; }
+    .action-btn.active { background: #d97706; color: #fff; border-color: #f59e0b; }
+
+    /* Inspector Panel */
+    .inspector-panel { position: absolute; top: 54px; right: 12px; width: 285px; background: rgba(15, 23, 42, 0.94); backdrop-filter: blur(14px); border: 1px solid rgba(255,255,255,0.18); border-radius: 10px; padding: 12px 14px; z-index: 15; box-shadow: 0 10px 28px rgba(0,0,0,0.6); }
+    .ins-header { font-size: 10.5px; font-weight: 700; color: #f59e0b; text-transform: uppercase; letter-spacing: 0.6px; display: flex; align-items: center; justify-content: space-between; }
+    .ins-village { font-size: 14px; font-weight: 700; color: #fff; margin-top: 3px; }
+    .ins-row { display: flex; justify-content: space-between; font-size: 11px; color: #94a3b8; margin-top: 4px; }
+    .ins-val { color: #f1f5f9; font-weight: 600; }
+    .ins-badge { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 10.5px; font-weight: 600; color: #fff; background: #10b981; }
+
+    /* Bottom Dock */
+    .bottom-dock { position: absolute; bottom: 10px; left: 12px; right: 12px; display: flex; align-items: center; justify-content: space-between; gap: 8px; z-index: 20; pointer-events: none; }
+    .dock-left { display: flex; align-items: center; gap: 10px; pointer-events: auto; background: rgba(15, 23, 42, 0.92); backdrop-filter: blur(12px); padding: 6px 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.18); }
+    .dock-center { display: flex; align-items: center; gap: 12px; pointer-events: auto; background: rgba(15, 23, 42, 0.94); backdrop-filter: blur(14px); padding: 6px 16px; border-radius: 30px; border: 1px solid rgba(255,255,255,0.22); box-shadow: 0 6px 24px rgba(0,0,0,0.45); }
+    .dock-right { display: flex; align-items: center; gap: 8px; pointer-events: auto; background: rgba(15, 23, 42, 0.92); backdrop-filter: blur(12px); padding: 6px 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.18); font-size: 11px; color: #cbd5e1; }
+    .dock-ctrl { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #e2e8f0; }
+    .dock-ctrl label { font-weight: 600; color: #fde047; white-space: nowrap; }
+    .dock-ctrl select { background: #1e293b; border: 1px solid #475569; color: #f8fafc; font-size: 11px; border-radius: 4px; padding: 2px 5px; outline: none; }
+    .dock-ctrl input[type=range] { width: 95px; accent-color: #f59e0b; cursor: pointer; }
+    .dock-val { font-weight: 700; color: #38bdf8; min-width: 26px; text-align: right; }
+
+    #well-tooltip { position: absolute; display: none; background: rgba(15,23,42,0.94); border: 1px solid #f59e0b; color: #fff; font-size: 11px; padding: 5px 9px; border-radius: 5px; pointer-events: none; z-index: 30; }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+  <div id="desert-canvas-wrap">
+    <canvas id="three-canvas"></canvas>
+    <div id="well-tooltip"></div>
+
+    <!-- Top Camera Toolbar -->
+    <div class="top-toolbar">
+      <div class="preset-bar">
+        <button class="preset-btn active" id="btn-iso" onclick="applyCameraPreset('iso')">📐 Elevated Isometric</button>
+        <button class="preset-btn" id="btn-basin" onclick="applyCameraPreset('basin')">🌐 50 km Basin</button>
+        <button class="preset-btn" id="btn-top" onclick="applyCameraPreset('top')">🛰️ Top-Down GIS</button>
+        <button class="preset-btn" id="btn-oblique" onclick="applyCameraPreset('oblique')">🌄 Low Oblique</button>
+        <button class="preset-btn" id="btn-cutaway" onclick="applyCameraPreset('cutaway')">🪓 Subsurface</button>
+        <button class="preset-btn" id="btn-settle" onclick="applyCameraPreset('settle')">🏘️ Settlements</button>
+        <button class="preset-btn" id="btn-river" onclick="applyCameraPreset('river')">🌊 Luni River</button>
+      </div>
+
+      <div class="top-actions">
+        <button class="action-btn active" id="amb-day" onclick="setAmbiance('day')">☀️ Day</button>
+        <button class="action-btn" id="amb-sunset" onclick="setAmbiance('sunset')">🌅 Sunset</button>
+        <button class="action-btn" id="amb-night" onclick="setAmbiance('night')">🌌 Night</button>
+      </div>
+    </div>
+
+    <!-- Inspector Panel -->
+    <div class="inspector-panel" id="inspector-panel">
+      <div class="ins-header">
+        <span>Hydrogeological Asset</span>
+        <span class="ins-badge" id="ins-badge">SAFE</span>
+      </div>
+      <div class="ins-village" id="ins-village">Govindgarh Wellhead</div>
+      <div class="ins-row"><span>District / Block:</span><span class="ins-val">Ajmer (Pisangan)</span></div>
+      <div class="ins-row"><span>WGS84 Coordinates:</span><span class="ins-val">26.4600°N, 74.5200°E</span></div>
+      <div class="ins-row"><span>Surface Elevation:</span><span class="ins-val">462.0 m ASL</span></div>
+      <div class="ins-row"><span>Active DTWL:</span><span class="ins-val" style="color:#38bdf8;">7.94 mbgl</span></div>
+      <div class="ins-row"><span>Water Table Elevation:</span><span class="ins-val">454.1 m ASL</span></div>
+      <div class="ins-row"><span>Regional Aquifer:</span><span class="ins-val">Luni Alluvial Semi-Confined</span></div>
+    </div>
+
+    <!-- Bottom Dock -->
+    <div class="bottom-dock">
+      <div class="dock-left">
+        <div style="font-family:monospace; font-size:10.5px; color:#cbd5e1;">📍 26.4500°N, 74.6300°E | 50 km Radius Coverage (~7,854 km²)</div>
+      </div>
+      <div class="dock-center">
+        <div class="dock-ctrl">
+          <label>🪓 Cutaway:</label>
+          <select id="cutaway-select" onchange="applyCutawayMode(this.value)">
+            <option value="complete">Complete Landscape</option>
+            <option value="partial">Partial Cutaway</option>
+            <option value="full">Full Geological Cutaway</option>
+            <option value="cross">Cross-Section</option>
+            <option value="groundwater">Groundwater-Only</option>
+          </select>
+        </div>
+        <div class="dock-ctrl">
+          <label>Slicer:</label>
+          <input type="range" id="slice-slider" min="0" max="100" value="0" oninput="onSliceInput(this.value)">
+          <span class="dock-val" id="slice-val">0%</span>
+        </div>
+        <div class="dock-ctrl">
+          <label>⛰️ Relief Exaggeration:</label>
+          <input type="range" id="exaggeration-slider" min="1.0" max="3.0" step="0.2" value="1.4" oninput="onExaggerationInput(this.value)">
+          <span class="dock-val" id="exaggeration-val">1.4x</span>
+        </div>
+      </div>
+      <div class="dock-right">
+        <span>Upper Luni Basin Digital Twin · <b>NVIDIA Omniverse Architecture</b></span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Global declarations
+    let scene, camera, renderer, controls;
+    let terrainMesh, terrainGeom, baseHeights = [];
+    let waterMesh, vadoseMesh, fracturedMesh, aquitardMesh, bedrockMesh;
+    let clipPlaneX;
+    let flowParticles, cloudGroup;
+    let wellGroup, settlementGroup, treeGroup, riverMesh;
+
+    // Fast 2D Simplex Noise Implementation (Pure JS, zero dependencies)
+    const Simplex = (function() {
+      const F2 = 0.5 * (Math.sqrt(3.0) - 1.0);
+      const G2 = (3.0 - Math.sqrt(3.0)) / 6.0;
+      const p = new Uint8Array(256);
+      for (let i = 0; i < 256; i++) p[i] = Math.floor(Math.random() * 256);
+      const perm = new Uint8Array(512);
+      const permMod12 = new Uint8Array(512);
+      for (let i = 0; i < 512; i++) {
+        perm[i] = p[i & 255];
+        permMod12[i] = (perm[i] % 12);
+      }
+      const grad3 = [
+        1,1,0, -1,1,0, 1,-1,0, -1,-1,0,
+        1,0,1, -1,0,1, 1,0,-1, -1,0,-1,
+        0,1,1, 0,-1,1, 0,1,-1, 0,-1,-1
+      ];
+
+      return {
+        noise2D: function(xin, yin) {
+          let n0, n1, n2;
+          const s = (xin + yin) * F2;
+          const i = Math.floor(xin + s);
+          const j = Math.floor(yin + s);
+          const t = (i + j) * G2;
+          const X0 = i - t;
+          const Y0 = j - t;
+          const x0 = xin - X0;
+          const y0 = yin - Y0;
+
+          let i1, j1;
+          if (x0 > y0) { i1 = 1; j1 = 0; } else { i1 = 0; j1 = 1; }
+
+          const x1 = x0 - i1 + G2;
+          const y1 = y0 - j1 + G2;
+          const x2 = x0 - 1.0 + 2.0 * G2;
+          const y2 = y0 - 1.0 + 2.0 * G2;
+
+          const ii = i & 255;
+          const jj = j & 255;
+          const gi0 = permMod12[ii + perm[jj]] * 3;
+          const gi1 = permMod12[ii + i1 + perm[jj + j1]] * 3;
+          const gi2 = permMod12[ii + 1 + perm[jj + 1]] * 3;
+
+          let t0 = 0.5 - x0 * x0 - y0 * y0;
+          if (t0 < 0) n0 = 0.0;
+          else { t0 *= t0; n0 = t0 * t0 * (grad3[gi0] * x0 + grad3[gi0 + 1] * y0); }
+
+          let t1 = 0.5 - x1 * x1 - y1 * y1;
+          if (t1 < 0) n1 = 0.0;
+          else { t1 *= t1; n1 = t1 * t1 * (grad3[gi1] * x1 + grad3[gi1 + 1] * y1); }
+
+          let t2 = 0.5 - x2 * x2 - y2 * y2;
+          if (t2 < 0) n2 = 0.0;
+          else { t2 *= t2; n2 = t2 * t2 * (grad3[gi2] * x2 + grad3[gi2 + 1] * y2); }
+
+          return 70.0 * (n0 + n1 + n2);
+        },
+        fbm2D: function(x, y, octaves = 4, lacunarity = 2.0, gain = 0.5) {
+          let sum = 0, amp = 1.0, freq = 1.0, maxAmp = 0;
+          for (let i = 0; i < octaves; i++) {
+            sum += this.noise2D(x * freq, y * freq) * amp;
+            maxAmp += amp;
+            amp *= gain;
+            freq *= lacunarity;
+          }
+          return sum / maxAmp;
+        }
+      };
+    })();
+
+    // River centerline: natural sinuous course of Upper Luni River
+    function getRiverZ(x) {
+      return 14.0 * Math.sin(x * 0.038) + 4.0 * Math.cos(x * 0.082) - 0.28 * x - 2.0;
+    }
+
+    // Realistic Regional Elevation Function
+    function getRegionalElevation(x, z) {
+      // 1. Regional topographic tilt: Northeast highlands slope down towards Southwest
+      const regionalSlope = (-x * 0.04 + z * 0.03);
+
+      // 2. Eastern Aravalli Mountain Range (strike runs NE-SW, x > -10)
+      let mountain = 0;
+      if (x > -15) {
+        // Main Aravalli Ridge (sharp, continuous quartzite crest)
+        const ridgeAxis = x - 28 - Math.sin(z * 0.06) * 12.0;
+        const dRidge = Math.abs(ridgeAxis);
+        const ridgeProfile = Math.max(0, 1.0 - dRidge / 14.0);
+        const ridgeH = Math.pow(ridgeProfile, 1.8) * 16.0;
+
+        // Secondary parallel ridge
+        const ridge2Axis = x - 48 - Math.cos(z * 0.05) * 8.0;
+        const dRidge2 = Math.abs(ridge2Axis);
+        const ridge2Profile = Math.max(0, 1.0 - dRidge2 / 12.0);
+        const ridge2H = Math.pow(ridge2Profile, 1.8) * 18.0;
+
+        // Mountain fractal detail (rugged crags & ravines)
+        const crags = Simplex.fbm2D(x * 0.08, z * 0.08, 3) * 2.8;
+        mountain = ridgeH + ridge2H + (ridgeProfile > 0.05 || ridge2Profile > 0.05 ? crags : 0);
+      }
+
+      // 3. Central Basin Alluvial Plain (gentle rolling pediments, < 3 deg slopes)
+      const plain = Simplex.fbm2D(x * 0.025, z * 0.025, 3) * 2.2 + 2.0;
+
+      // 4. Luni River Channel Incision (carved 1.6m down with a flat sandy bed)
+      const rz = getRiverZ(x);
+      const dRiver = Math.abs(z - rz);
+      let riverIncision = 0;
+      if (dRiver < 6.0 && x < 40) {
+        // Flat river channel with smooth banks
+        const t = dRiver / 6.0;
+        riverIncision = -(1.0 - Math.pow(t, 2.5)) * 2.2;
+      }
+
+      // 5. Western Thar Desert Aeolian Sand Dunes (x < 10)
+      let dunes = 0;
+      if (x < 15) {
+        // Linear longitudinal dunes (seif) aligned with southwest monsoon winds (~45 deg)
+        const u = (x + z) * 0.06;
+        const v = (-x + z) * 0.09;
+        const seif = Math.sin(v * 3.5 + Simplex.noise2D(u * 1.5, v * 1.5) * 0.8) * 1.8;
+        const duneWeight = Math.max(0, Math.min(1.0, (15 - x) / 45.0));
+        dunes = seif * duneWeight;
+      }
+
+      const totalH = regionalSlope + mountain + plain + riverIncision + dunes;
+      const exag = parseFloat(document.getElementById('exaggeration-slider') ? document.getElementById('exaggeration-slider').value : 1.4);
+      return totalH * exag;
+    }
+
+    // -------------------------------------------------------------
+    // PROCEDURAL SATELLITE ORTHOPHOTO TEXTURE (2048 x 2048 CANVAS)
+    // -------------------------------------------------------------
+    function createProceduralSatelliteTexture() {
+      const size = 1024;
+      const canvasTex = document.createElement('canvas');
+      canvasTex.width = size;
+      canvasTex.height = size;
+      const ctx = canvasTex.getContext('2d');
+
+      // Base Alluvial Soil Background (warm buff/ochre soil)
+      ctx.fillStyle = '#b89065';
+      ctx.fillRect(0, 0, size, size);
+
+      // Loop through pixels in blocks to generate satellite orthophoto
+      const imgData = ctx.getImageData(0, 0, size, size);
+      const data = imgData.data;
+
+      for (let py = 0; py < size; py++) {
+        for (let px = 0; px < size; px++) {
+          // Map pixel to world (x, z) in [-80, 80]
+          const wx = (px / size) * 160.0 - 80.0;
+          const wz = (py / size) * 160.0 - 80.0;
+
+          const rz = getRiverZ(wx);
+          const dRiver = Math.abs(wz - rz);
+
+          let r, g, b;
+
+          // 1. Aravalli Mountain Ranges (East, wx > -10)
+          if (wx > 8) {
+            const rockNoise = Simplex.fbm2D(wx * 0.06, wz * 0.06, 3);
+            if (wx > 20) {
+              // Deep quartzite rock & slate schist with shadows
+              r = 95 + rockNoise * 30;
+              g = 82 + rockNoise * 25;
+              b = 72 + rockNoise * 20;
+            } else {
+              // Mountain scree & pediment talus
+              r = 145 + rockNoise * 25;
+              g = 115 + rockNoise * 20;
+              b = 85 + rockNoise * 15;
+            }
+          }
+          // 2. Luni River Corridor & Sandbars
+          else if (dRiver < 5.0 && wx < 40) {
+            if (dRiver < 2.0) {
+              // Pale dry riverbed sand & gravel bars
+              r = 220; g = 195; b = 155;
+            } else {
+              // Moist riparian alluvial soil & vegetation fringe
+              r = 110; g = 125; b = 65;
+            }
+          }
+          // 3. Western Thar Sand Dunes (wx < -12)
+          else if (wx < -12) {
+            const duneNoise = Simplex.fbm2D(wx * 0.1, wz * 0.1, 2);
+            r = 215 + duneNoise * 20;
+            g = 155 + duneNoise * 20;
+            b = 80 + duneNoise * 15;
+          }
+          // 4. Central Agricultural Cadastral Mosaic
+          else {
+            const gridX = Math.floor((wx + 80) / 4.0);
+            const gridZ = Math.floor((wz + 80) / 4.0);
+            const fieldHash = Math.abs(Math.sin(gridX * 12.9898 + gridZ * 78.233)) * 43758.5453;
+            const fieldType = Math.floor(fieldHash) % 6;
+
+            if (fieldType === 0) { // Lush irrigated wheat / mustard (emerald green)
+              r = 38; g = 115; b = 52;
+            } else if (fieldType === 1) { // Fresh irrigated Rabi crop
+              r = 55; g = 135; b = 60;
+            } else if (fieldType === 2) { // Golden harvest parcel
+              r = 205; g = 165; b = 55;
+            } else if (fieldType === 3) { // Dark moist plowed loam
+              r = 98; g = 68; b = 42;
+            } else { // Fallow dry pediment
+              r = 168; g = 130; b = 88;
+            }
+
+            // Dark field boundary hedgerows
+            const borderX = Math.abs((wx + 80) % 4.0);
+            const borderZ = Math.abs((wz + 80) % 4.0);
+            if (borderX < 0.25 || borderZ < 0.25) {
+              r *= 0.65; g *= 0.65; b *= 0.65;
+            }
+          }
+
+          const idx = (py * size + px) * 4;
+          data[idx] = Math.min(255, Math.max(0, r));
+          data[idx + 1] = Math.min(255, Math.max(0, g));
+          data[idx + 2] = Math.min(255, Math.max(0, b));
+          data[idx + 3] = 255;
+        }
+      }
+
+      ctx.putImageData(imgData, 0, 0);
+
+      const texture = new THREE.CanvasTexture(canvasTex);
+      texture.wrapS = THREE.ClampToEdgeWrapping;
+      texture.wrapT = THREE.ClampToEdgeWrapping;
+      texture.anisotropy = 4;
+      return texture;
+    }
+
+    // -------------------------------------------------------------
+    // INITIALIZE PHOTOREALISTIC THREE.JS ENGINE
+    // -------------------------------------------------------------
+    function initEngine() {
+      const wrap = document.getElementById('desert-canvas-wrap');
+      const canvas = document.getElementById('three-canvas');
+      const w = wrap.clientWidth || 800;
+      const h = wrap.clientHeight || 760;
+
+      // 1. Scene & Skybox
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xdbeafe);
+      scene.fog = new THREE.FogExp2(0xfef3c7, 0.005);
+
+      // Sky Dome with Atmospheric Gradient
+      const skyGeom = new THREE.SphereGeometry(260, 32, 16);
+      const skyMat = new THREE.MeshBasicMaterial({ color: 0x93c5fd, side: THREE.BackSide });
+      const sky = new THREE.Mesh(skyGeom, skyMat);
+      scene.add(sky);
+
+      // 2. Camera: Elevated Isometric View (default ~35 deg downward pitch, framing entire 50 km basin)
+      camera = new THREE.PerspectiveCamera(40, w / h, 0.5, 600);
+      camera.position.set(55, 42, 65);
+
+      // 3. Renderer with Soft Shadows & Local Clipping
+      renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, powerPreference: 'high-performance' });
+      renderer.setSize(w, h);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      renderer.localClippingEnabled = true;
+
+      controls = new THREE.OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.08;
+      controls.maxPolarAngle = Math.PI / 2 - 0.03;
+      controls.minDistance = 8;
+      controls.maxDistance = 260;
+      controls.target.set(-5, 0, -5);
+
+      // 4. Natural Directional Sunlight & Ambient Illumination
+      const hemiLight = new THREE.HemisphereLight(0xfffbeb, 0x92400e, 0.65);
+      scene.add(hemiLight);
+
+      const dirLight = new THREE.DirectionalLight(0xfff7ed, 1.35);
+      dirLight.position.set(65, 80, 50);
+      dirLight.castShadow = true;
+      dirLight.shadow.mapSize.width = 2048;
+      dirLight.shadow.mapSize.height = 2048;
+      dirLight.shadow.camera.near = 10;
+      dirLight.shadow.camera.far = 280;
+      dirLight.shadow.camera.left = -85;
+      dirLight.shadow.camera.right = 85;
+      dirLight.shadow.camera.top = 85;
+      dirLight.shadow.camera.bottom = -85;
+      dirLight.shadow.bias = -0.0003;
+      scene.add(dirLight);
+
+      // 5. Geological Cutaway Slicer Plane
+      clipPlaneX = new THREE.Plane(new THREE.Vector3(1, 0, 0), 95.0);
+
+      // 6. Terrain Mesh with Procedural Satellite Orthophoto Texture
+      const segs = 140;
+      terrainGeom = new THREE.PlaneGeometry(160, 160, segs, segs);
+      terrainGeom.rotateX(-Math.PI / 2);
+
+      const pos = terrainGeom.attributes.position;
+      baseHeights = new Float32Array(pos.count);
+      for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i);
+        const z = pos.getZ(i);
+        const y = getRegionalElevation(x, z);
+        baseHeights[i] = y;
+        pos.setY(i, y);
+      }
+      terrainGeom.computeVertexNormals();
+
+      const satTexture = createProceduralSatelliteTexture();
+      const terrainMat = new THREE.MeshStandardMaterial({
+        map: satTexture,
+        roughness: 0.92,
+        metalness: 0.02,
+        side: THREE.DoubleSide,
+        clippingPlanes: [clipPlaneX],
+        clipShadows: true,
+      });
+
+      terrainMesh = new THREE.Mesh(terrainGeom, terrainMat);
+      terrainMesh.receiveShadow = true;
+      terrainMesh.castShadow = true;
+      scene.add(terrainMesh);
+
+      // 7. Subsurface 3D Geological Stratigraphy Blocks
+      const waterY = -2.5;
+
+      // Saturated Luni Principal Aquifer Table (glowing cyan-blue)
+      const waterGeom = new THREE.PlaneGeometry(158, 158, 32, 32);
+      waterGeom.rotateX(-Math.PI / 2);
+      const waterMat = new THREE.MeshStandardMaterial({
+        color: 0x00b4d8,
+        roughness: 0.15,
+        metalness: 0.60,
+        transparent: true,
+        opacity: 0.85,
+        side: THREE.DoubleSide,
+      });
+      waterMesh = new THREE.Mesh(waterGeom, waterMat);
+      waterMesh.position.y = waterY;
+      scene.add(waterMesh);
+
+      // Vadose Zone Murrum Block
+      const vadoseGeom = new THREE.BoxGeometry(158, 3.5, 158);
+      const vadoseMat = new THREE.MeshStandardMaterial({
+        color: 0x854d0e,
+        roughness: 0.92,
+        side: THREE.DoubleSide,
+        clippingPlanes: [clipPlaneX],
+      });
+      vadoseMesh = new THREE.Mesh(vadoseGeom, vadoseMat);
+      vadoseMesh.position.y = waterY - 1.75;
+      scene.add(vadoseMesh);
+
+      // Fractured Sandstone & Quartzite Block
+      const fracGeom = new THREE.BoxGeometry(158, 3.2, 158);
+      const fracMat = new THREE.MeshStandardMaterial({
+        color: 0xb45309,
+        roughness: 0.88,
+        side: THREE.DoubleSide,
+        clippingPlanes: [clipPlaneX],
+      });
+      fracturedMesh = new THREE.Mesh(fracGeom, fracMat);
+      fracturedMesh.position.y = waterY - 5.1;
+      scene.add(fracturedMesh);
+
+      // Confining Clayey Aquitard Block
+      const aquitardGeom = new THREE.BoxGeometry(158, 2.2, 158);
+      const aquitardMat = new THREE.MeshStandardMaterial({
+        color: 0x475569,
+        roughness: 0.92,
+        side: THREE.DoubleSide,
+        clippingPlanes: [clipPlaneX],
+      });
+      aquitardMesh = new THREE.Mesh(aquitardGeom, aquitardMat);
+      aquitardMesh.position.y = waterY - 7.8;
+      scene.add(aquitardMesh);
+
+      // Deep Malani Granite Basement Block
+      const bedrockGeom = new THREE.BoxGeometry(158, 4.5, 158);
+      const bedrockMat = new THREE.MeshStandardMaterial({
+        color: 0x0f172a,
+        roughness: 0.96,
+        side: THREE.DoubleSide,
+        clippingPlanes: [clipPlaneX],
+      });
+      bedrockMesh = new THREE.Mesh(bedrockGeom, bedrockMat);
+      bedrockMesh.position.y = waterY - 11.15;
+      scene.add(bedrockMesh);
+
+      // 8. Luni Flowing River Water Mesh
+      const riverPts = [];
+      for (let rx = -75; rx <= 42; rx += 3) {
+        const rz = getRiverZ(rx);
+        const ry = getRegionalElevation(rx, rz) + 0.15;
+        riverPts.push(new THREE.Vector3(rx, ry, rz));
+      }
+      const riverCurve = new THREE.CatmullRomCurve3(riverPts);
+      const riverTubeGeom = new THREE.TubeGeometry(riverCurve, 90, 1.4, 8, false);
+      const riverWaterMat = new THREE.MeshStandardMaterial({
+        color: 0x0284c7,
+        roughness: 0.15,
+        metalness: 0.55,
+        transparent: true,
+        opacity: 0.88,
+        clippingPlanes: [clipPlaneX],
+      });
+      riverMesh = new THREE.Mesh(riverTubeGeom, riverWaterMat);
+      scene.add(riverMesh);
+
+      // Highway Bridge crossing Luni River near Govindgarh
+      const bridgeX = -6, bridgeZ = getRiverZ(bridgeX);
+      const bridgeY = getRegionalElevation(bridgeX, bridgeZ) + 1.6;
+      const bridgeDeckGeom = new THREE.BoxGeometry(3.5, 0.4, 11);
+      const concreteMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, roughness: 0.85 });
+      const bridgeDeck = new THREE.Mesh(bridgeDeckGeom, concreteMat);
+      bridgeDeck.position.set(bridgeX, bridgeY, bridgeZ);
+      bridgeDeck.castShadow = true;
+      scene.add(bridgeDeck);
+
+      // 9. Populated Human Settlements (Govindgarh, Pushkar, Pisangan, Srinagar)
+      settlementGroup = new THREE.Group();
+      scene.add(settlementGroup);
+
+      const villages = [
+        { name: "Govindgarh", x: -8, z: -2, count: 26 },
+        { name: "Pushkar Rural", x: 18, z: 22, count: 20 },
+        { name: "Pisangan", x: -32, z: -16, count: 22 },
+        { name: "Srinagar", x: 28, z: -8, count: 18 },
+      ];
+
+      villages.forEach(v => {
+        for (let b = 0; b < v.count; b++) {
+          const bx = v.x + (Math.random() - 0.5) * 10;
+          const bz = v.z + (Math.random() - 0.5) * 10;
+          const by = getRegionalElevation(bx, bz);
+
+          const w = 1.3 + Math.random() * 1.0;
+          const h = 1.1 + Math.random() * 0.8;
+          const d = 1.3 + Math.random() * 1.0;
+
+          const isWhite = Math.random() > 0.4;
+          const houseGeom = new THREE.BoxGeometry(w, h, d);
+          const houseMat = new THREE.MeshStandardMaterial({
+            color: isWhite ? 0xf8fafc : 0xd4a373,
+            roughness: 0.88,
+            clippingPlanes: [clipPlaneX],
+          });
+          const house = new THREE.Mesh(houseGeom, houseMat);
+          house.position.set(bx, by + h / 2, bz);
+          house.castShadow = true;
+          settlementGroup.add(house);
+
+          // Rooftop Blue Water Storage Tank
+          if (Math.random() > 0.4) {
+            const tankGeom = new THREE.CylinderGeometry(0.2, 0.2, 0.4, 8);
+            const tankMat = new THREE.MeshStandardMaterial({ color: 0x0284c7 });
+            const tank = new THREE.Mesh(tankGeom, tankMat);
+            tank.position.set(bx + 0.2, by + h + 0.2, bz + 0.2);
+            settlementGroup.add(tank);
+          }
+        }
+
+        // Traditional Village Stepwell (Baori)
+        const baoriY = getRegionalElevation(v.x + 3.0, v.z + 3.0);
+        const baoriGeom = new THREE.CylinderGeometry(1.6, 1.2, 1.4, 8);
+        const baoriMat = new THREE.MeshStandardMaterial({ color: 0x64748b, roughness: 0.9 });
+        const baori = new THREE.Mesh(baoriGeom, baoriMat);
+        baori.position.set(v.x + 3.0, baoriY + 0.2, v.z + 3.0);
+        settlementGroup.add(baori);
+      });
+
+      // 10. Monitoring Wells with Status-Coded Beacons
+      wellGroup = new THREE.Group();
+      scene.add(wellGroup);
+
+      const wellLocs = [
+        { name: "Govindgarh Well", x: -8, z: -2, status: "Safe", color: 0x10b981 },
+        { name: "Pisangan Central", x: -32, z: -16, status: "Critical", color: 0xf97316 },
+        { name: "Srinagar Station", x: 28, z: -8, status: "Semi-Critical", color: 0xf59e0b },
+        { name: "Pushkar Hydrowell", x: 18, z: 22, status: "Safe", color: 0x10b981 },
+        { name: "Saradhna Piezometer", x: 4, z: -24, status: "Safe", color: 0x10b981 },
+        { name: "Alwar Gate Observation", x: 12, z: 4, status: "Semi-Critical", color: 0xf59e0b },
+      ];
+
+      wellLocs.forEach(w => {
+        const wy = getRegionalElevation(w.x, w.z);
+
+        // Borehole casing down to aquifer
+        const tubeH = Math.max(2.0, wy - waterY + 2.0);
+        const tubeGeom = new THREE.CylinderGeometry(0.18, 0.18, tubeH, 8);
+        const tubeMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, metalness: 0.8 });
+        const tube = new THREE.Mesh(tubeGeom, tubeMat);
+        tube.position.set(w.x, wy - tubeH / 2, w.z);
+        tube.castShadow = true;
+        wellGroup.add(tube);
+
+        // Concrete Apron
+        const apronGeom = new THREE.CylinderGeometry(1.1, 1.3, 0.3, 8);
+        const apronMat = new THREE.MeshStandardMaterial({ color: 0x64748b });
+        const apron = new THREE.Mesh(apronGeom, apronMat);
+        apron.position.set(w.x, wy + 0.15, w.z);
+        wellGroup.add(apron);
+
+        // Telemetry Mast & Solar Panel
+        const mastGeom = new THREE.CylinderGeometry(0.06, 0.06, 2.2, 6);
+        const mastMat = new THREE.MeshStandardMaterial({ color: 0x1e293b });
+        const mast = new THREE.Mesh(mastGeom, mastMat);
+        mast.position.set(w.x, wy + 1.25, w.z);
+        wellGroup.add(mast);
+
+        const panelGeom = new THREE.BoxGeometry(1.1, 0.04, 0.8);
+        const panelMat = new THREE.MeshStandardMaterial({ color: 0x1e3a8a, metalness: 0.7 });
+        const panel = new THREE.Mesh(panelGeom, panelMat);
+        panel.position.set(w.x, wy + 2.1, w.z);
+        panel.rotation.x = 0.45;
+        wellGroup.add(panel);
+
+        // LED Status Beacon
+        const ledGeom = new THREE.SphereGeometry(0.3, 12, 12);
+        const ledMat = new THREE.MeshBasicMaterial({ color: w.color });
+        const led = new THREE.Mesh(ledGeom, ledMat);
+        led.position.set(w.x, wy + 2.5, w.z);
+        wellGroup.add(led);
+      });
+
+      // 11. Natural Xerophytic Khejri & Rohida Trees
+      treeGroup = new THREE.Group();
+      scene.add(treeGroup);
+
+      const treeCount = 120;
+      const trunkGeom = new THREE.CylinderGeometry(0.16, 0.28, 1.8, 6);
+      const trunkMat = new THREE.MeshStandardMaterial({ color: 0x5c2c0e, roughness: 0.95, clippingPlanes: [clipPlaneX] });
+      const canopyGeom = new THREE.CylinderGeometry(1.8, 0.5, 0.75, 8);
+      const canopyMat = new THREE.MeshStandardMaterial({ color: 0x3f6212, roughness: 0.85, clippingPlanes: [clipPlaneX] });
+
+      const trunkInst = new THREE.InstancedMesh(trunkGeom, trunkMat, treeCount);
+      const canopyInst = new THREE.InstancedMesh(canopyGeom, canopyMat, treeCount);
+      const mat4 = new THREE.Matrix4();
+      const posV = new THREE.Vector3();
+      const quat = new THREE.Quaternion();
+      const scaleV = new THREE.Vector3(1, 1, 1);
+
+      let placed = 0;
+      for (let t = 0; t < treeCount; t++) {
+        const tx = (Math.random() - 0.5) * 120;
+        const tz = (Math.random() - 0.5) * 120;
+        const ty = getRegionalElevation(tx, tz);
+        if (ty < 10.0) { // On plains and fields
+          posV.set(tx, ty + 0.9, tz);
+          mat4.compose(posV, quat, scaleV);
+          trunkInst.setMatrixAt(placed, mat4);
+
+          posV.set(tx, ty + 2.0, tz);
+          mat4.compose(posV, quat, scaleV);
+          canopyInst.setMatrixAt(placed, mat4);
+          placed++;
+        }
+      }
+      trunkInst.count = placed;
+      canopyInst.count = placed;
+      trunkInst.castShadow = true;
+      treeGroup.add(trunkInst);
+      treeGroup.add(canopyInst);
+
+      // 12. 3D Darcy Groundwater Flow Particles
+      const pCount = 350;
+      const pGeom = new THREE.BufferGeometry();
+      const pPos = new Float32Array(pCount * 3);
+      for (let p = 0; p < pCount; p++) {
+        pPos[p * 3 + 0] = (Math.random() - 0.5) * 140;
+        pPos[p * 3 + 1] = waterY + 0.05;
+        pPos[p * 3 + 2] = (Math.random() - 0.5) * 140;
+      }
+      pGeom.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+      const pMat = new THREE.PointsMaterial({ color: 0x00f5ff, size: 0.38, transparent: true, opacity: 0.85 });
+      flowParticles = new THREE.Points(pGeom, pMat);
+      scene.add(flowParticles);
+
+      // Render Loop
+      let clock = new THREE.Clock();
+      function animate() {
+        requestAnimationFrame(animate);
+        const elapsed = clock.getElapsedTime();
+
+        // Animate groundwater flow along hydraulic gradient (NE to SW)
+        if (flowParticles) {
+          const arr = flowParticles.geometry.attributes.position.array;
+          for (let i = 0; i < pCount; i++) {
+            arr[i * 3 + 0] -= 0.05;
+            arr[i * 3 + 2] -= 0.035;
+            if (arr[i * 3 + 0] < -70) arr[i * 3 + 0] = 70;
+            if (arr[i * 3 + 2] < -70) arr[i * 3 + 2] = 70;
+          }
+          flowParticles.geometry.attributes.position.needsUpdate = true;
+        }
+
+        controls.update();
+        renderer.render(scene, camera);
+      }
+      animate();
+    }
+
+    function applyCameraPreset(preset) {
+      document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+      const btn = document.getElementById('btn-' + preset);
+      if (btn) btn.classList.add('active');
+
+      if (preset === 'iso') {
+        camera.position.set(55, 42, 65);
+        controls.target.set(-5, 0, -5);
+      } else if (preset === 'basin') {
+        camera.position.set(0, 105, 95);
+        controls.target.set(0, 0, 0);
+      } else if (preset === 'top') {
+        camera.position.set(0, 125, 0.001);
+        controls.target.set(0, 0, 0);
+      } else if (preset === 'oblique') {
+        camera.position.set(65, 14, 65);
+        controls.target.set(0, 2, 0);
+      } else if (preset === 'cutaway') {
+        camera.position.set(45, 22, -45);
+        controls.target.set(0, -3, 0);
+        applyCutawayMode('partial');
+      } else if (preset === 'settle') {
+        camera.position.set(-8 + 12, 10, -2 + 12);
+        controls.target.set(-8, 2, -2);
+      } else if (preset === 'river') {
+        camera.position.set(10, 15, 12);
+        controls.target.set(-15, 2, -5);
+      }
+    }
+
+    function applyCutawayMode(mode) {
+      document.getElementById('cutaway-select').value = mode;
+      const sliceSlider = document.getElementById('slice-slider');
+      const sliceVal = document.getElementById('slice-val');
+      if (mode === 'complete') {
+        clipPlaneX.constant = 95.0;
+        sliceSlider.value = 0;
+        sliceVal.innerText = '0%';
+        terrainMesh.visible = true;
+      } else if (mode === 'partial') {
+        clipPlaneX.constant = 20.0;
+        sliceSlider.value = 35;
+        sliceVal.innerText = '35%';
+        terrainMesh.visible = true;
+      } else if (mode === 'full') {
+        clipPlaneX.constant = 0.0;
+        sliceSlider.value = 50;
+        sliceVal.innerText = '50%';
+        terrainMesh.visible = true;
+      } else if (mode === 'cross') {
+        clipPlaneX.constant = -6.0;
+        sliceSlider.value = 55;
+        sliceVal.innerText = '55%';
+        terrainMesh.visible = true;
+      } else if (mode === 'groundwater') {
+        terrainMesh.visible = false;
+      }
+    }
+
+    function onSliceInput(val) {
+      const pct = parseFloat(val);
+      document.getElementById('slice-val').innerText = pct + '%';
+      clipPlaneX.constant = 90.0 - (pct / 100.0) * 170.0;
+    }
+
+    function onExaggerationInput(val) {
+      const factor = parseFloat(val);
+      document.getElementById('exaggeration-val').innerText = factor.toFixed(1) + 'x';
+      if (!terrainGeom) return;
+      const pos = terrainGeom.attributes.position;
+      for (let i = 0; i < pos.count; i++) {
+        pos.setY(i, baseHeights[i] * (factor / 1.4));
+      }
+      pos.needsUpdate = true;
+      terrainGeom.computeVertexNormals();
+    }
+
+    function setAmbiance(mode) {
+      document.querySelectorAll('.action-btn').forEach(b => {
+        if (b.id && b.id.startsWith('amb-')) b.classList.remove('active');
+      });
+      const btn = document.getElementById('amb-' + mode);
+      if (btn) btn.classList.add('active');
+
+      if (mode === 'day') {
+        scene.background.set(0xdbeafe);
+        scene.fog.color.set(0xfef3c7);
+      } else if (mode === 'sunset') {
+        scene.background.set(0xf97316);
+        scene.fog.color.set(0xea580c);
+      } else if (mode === 'night') {
+        scene.background.set(0x070b14);
+        scene.fog.color.set(0x070b14);
+      }
+    }
+
+    window.addEventListener('DOMContentLoaded', initEngine);
+  </script>
+</body>
+</html>
+"""
+
+with open(r"D:\NIH_roorkee\FULL WORK FINAL_DIGITAL_NAYA_PANI\NAYA_PAANI\scratch\prototype_photoreal.html", "w", encoding="utf-8") as f:
+    f.write(html_content)
+
+print("Saved scratch/prototype_photoreal.html successfully!")

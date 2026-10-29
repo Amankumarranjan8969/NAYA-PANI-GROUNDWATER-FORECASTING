@@ -53,6 +53,7 @@ class KnowledgeBase:
                     continue
                 self.documents.append({
                     "source": path.name,
+                    "section_citation": f"{path.name}#{heading}" if heading else path.name,
                     "title": path.stem.replace("_", " ").title(),
                     "heading": heading,
                     "text": chunk,

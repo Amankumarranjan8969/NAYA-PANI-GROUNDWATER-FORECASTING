@@ -14,7 +14,8 @@ The pipeline stages are:
 4. Training-only feature selection (mRMR or mutual information)
 5. Multi-model training with temporal train/validation/test split
 6. Bias-corrected held-out evaluation
-7. Diagnostics, sensitivity, forecast, wavelet analysis
+7. Diagnostics, sensitivity, forecast, wavelet analysis, and a data-bound
+   Digital Twin view of selected seasonal states
 8. A second, separate deep-learning / physics-informed pass (PINN, reservoir
    computing, SARIMA, and LSTM), shown on its own tab
 

@@ -1,0 +1,67 @@
+{
+  "id": "/",
+  "name": "Naya Pani — Groundwater Intelligence & Digital Twin",
+  "short_name": "NayaPani",
+  "description": "Groundwater level forecasting, Digital Twin simulation, and AI decision-support platform for Rajasthan.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#F5F5F7",
+  "theme_color": "#0071E3",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/nayapani-icon-192.png?v=4",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/nayapani-icon-192.png?v=4",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/nayapani-icon-512.png?v=4",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/nayapani-icon-512.png?v=4",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/favicon.ico?v=4",
+      "sizes": "16x16 32x32 48x48 64x64 128x128 256x256",
+      "type": "image/x-icon",
+      "purpose": "any"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Forecast",
+      "short_name": "Forecast",
+      "description": "View projected groundwater levels",
+      "url": "/?nav=Forecast",
+      "icons": [{ "src": "/nayapani-icon-192.png?v=4", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "Digital Twin",
+      "short_name": "Digital Twin",
+      "description": "Access Rajasthan Digital Twin simulation",
+      "url": "/?nav=Digital+Twin",
+      "icons": [{ "src": "/nayapani-icon-192.png?v=4", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "Admin Panel",
+      "short_name": "Admin",
+      "description": "Open Administrator Control Center",
+      "url": "/?page=admin",
+      "icons": [{ "src": "/nayapani-icon-192.png?v=4", "sizes": "192x192", "type": "image/png" }]
+    }
+  ]
+}

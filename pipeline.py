@@ -1,9 +1,3 @@
-"""Reusable groundwater modelling workflow extracted from the rajasthan notebook.
-
-The dashboard keeps the notebook's seasonal workflow, but makes its assumptions
-explicit and safeguards optional third-party model libraries.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -87,7 +81,7 @@ COLUMN_ALIASES = {
     "ndbi": "NDBI",
     "ndwi": "NDWI",
 
-    # geometry
+    # geometry & geospatial
     "slope_degree(12/05/2026)": "Slope_Degree",
     "slope_degree": "Slope_Degree",
     "slope_percent": "Slope_Percent",
@@ -98,6 +92,15 @@ COLUMN_ALIASES = {
     "aspect": "Aspect",
     "drainage density": "Drainage density",
     "distance to drainage": "Distance to drainage",
+    "distance to drainage ": "Distance to drainage",
+    "elevation": "Elevation",
+    "latitude": "LATITUDE",
+    "longitude": "LONGITUDE",
+    "district": "DISTRICT",
+    "block": "BLOCK",
+    "state_ut": "STATE_UT",
+    "village": "VILLAGE",
+    "year": "YEAR",
 }
 
 
@@ -197,10 +200,12 @@ def load_seasonal_workbook(source: Any) -> tuple[pd.DataFrame, pd.DataFrame, lis
             )
             continue
 
-        frame = frame.drop(
-            columns=[column for column in META_COLUMNS if column in frame.columns],
-            errors="ignore",
-        )
+        # Preserve META_COLUMNS (STATE_UT, DISTRICT, BLOCK, LATITUDE, LONGITUDE) for
+        # Digital Twin geospatial visualization and administrative filtering; they are
+        # excluded at prepare_modelling_data() so ML feature selection is unaffected.
+        for coord_col in ("LATITUDE", "LONGITUDE"):
+            if coord_col in frame.columns:
+                frame[coord_col] = pd.to_numeric(frame[coord_col], errors="coerce")
         frame["Season"] = season
         frames.append(_as_numeric(frame))
 
@@ -286,21 +291,6 @@ def engineer_features(data: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 def create_lag_features(
     data: pd.DataFrame, rescue_low_data: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, list[str]], int, bool]:
-    """Create the lag, rolling, and trend variables from the notebook workflow.
-
-    By default this drops every row with any incomplete lag/rolling/trend
-    value, exactly like the notebook. When `rescue_low_data=True` and that
-    strict drop would leave too few rows to model, incomplete *engineered*
-    values (lags, rolling stats, trends — never the target itself) are
-    imputed instead of dropped: forward/back-filled within each village,
-    then any still-missing cells filled with the column median. This only
-    changes behaviour when the strict path is not enough data on its own —
-    see `run_season_pipeline`, which tries the strict path first and only
-    retries with `rescue_low_data=True` if that path can't support the
-    configured train/validation/test split.
-
-    Returns (complete_frame, feature_groups, rows_removed, rescue_used).
-    """
     frame = data.sort_values(["VILLAGE", "YEAR"]).copy()
     grouped = frame.groupby("VILLAGE", sort=False)
     lag_config = {
@@ -344,7 +334,8 @@ def create_lag_features(
 
     initial_rows = len(frame)
     engineered_columns = lag_features + rolling_features + trend_features
-    complete = frame.dropna().reset_index(drop=True)
+    non_meta_cols = [c for c in frame.columns if c not in META_COLUMNS]
+    complete = frame.dropna(subset=non_meta_cols).reset_index(drop=True)
     rescue_used = False
 
     if rescue_low_data and len(frame) > len(complete):
@@ -361,7 +352,24 @@ def create_lag_features(
             if still_missing.to_numpy().any():
                 medians = rescued[existing_engineered].median(numeric_only=True)
                 rescued[existing_engineered] = rescued[existing_engineered].fillna(medians)
-        essential_columns = [c for c in rescued.columns if c not in existing_engineered]
+        essential_columns = ["VILLAGE", "YEAR", "Season", TARGET]
+        predictor_columns = [c for c in rescued.columns if c not in essential_columns and c not in META_COLUMNS]
+        for column in predictor_columns:
+            if rescued[column].isna().any():
+                if pd.api.types.is_numeric_dtype(rescued[column]):
+                    filled = rescued.groupby("VILLAGE", sort=False)[column].transform(
+                        lambda values: values.ffill().bfill()
+                    )
+                    median = filled.median()
+                    rescued[column] = filled.fillna(0 if pd.isna(median) else median)
+                else:
+                    filled = rescued.groupby("VILLAGE", sort=False)[column].transform(
+                        lambda values: values.ffill().bfill()
+                    )
+                    mode = filled.mode()
+                    rescued[column] = filled.fillna(
+                        mode.iloc[0] if not mode.empty else "Unknown"
+                    )
         rescued = rescued.dropna(subset=essential_columns).reset_index(drop=True)
         if len(rescued) > len(complete):
             complete = rescued
@@ -377,7 +385,7 @@ def create_lag_features(
 
 
 def prepare_modelling_data(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Series, list[str]]:
-    excluded = {"VILLAGE", "YEAR", "Season", TARGET, "Slope_Degree", "DATE"}
+    excluded = {"VILLAGE", "YEAR", "Season", TARGET, "Slope_Degree", "DATE"} | set(META_COLUMNS)
     feature_columns = [column for column in data.columns if column not in excluded]
     features = data[feature_columns].copy()
     for column in features.select_dtypes(include=["object", "category"]).columns:
@@ -416,8 +424,16 @@ def temporal_split(features: pd.DataFrame, target: pd.Series, years: pd.Series,
 def select_features(features: pd.DataFrame, target: pd.Series, requested_count: int) -> pd.DataFrame:
     """Use mRMR when available, otherwise mutual information plus correlation."""
     count = min(max(1, requested_count), features.shape[1])
-    mi_values = mutual_info_regression(features, target, random_state=42)
-    correlation = features.corrwith(target).abs().fillna(0)
+    if len(target) < 4:
+        mi_values = np.zeros(features.shape[1])
+    else:
+        mi_values = mutual_info_regression(features, target, random_state=42)
+    correlation = pd.Series(0.0, index=features.columns)
+    variable_columns = features.columns[features.nunique(dropna=True) > 1]
+    if len(target) > 1 and target.nunique(dropna=True) > 1 and len(variable_columns):
+        correlation.loc[variable_columns] = (
+            features[variable_columns].corrwith(target).abs().fillna(0)
+        )
     ranking = pd.DataFrame({"Feature": features.columns, "Mutual information": mi_values,
                             "Absolute correlation": [correlation[column] for column in features.columns]})
     ranking["Selection method"] = "Mutual information"
@@ -799,9 +815,12 @@ def run_season_pipeline(data: pd.DataFrame, season: str, config: RunConfig,
 
     update("Preparing the temporal train, validation, and test data")
     features, target, years, all_feature_names = prepare_modelling_data(lagged)
+    split_mode = "temporal holdout"
     try:
         split = temporal_split(features, target, years, config)
-    except ValueError:
+    except ValueError as split_error:
+        if config.train_end >= config.validation_end:
+            raise
         # The strict (notebook-faithful) drop-NaN pass left too few rows for
         # the configured split. Retry once, this time imputing incomplete
         # engineered (lag/rolling/trend) values within each village instead
@@ -812,10 +831,30 @@ def run_season_pipeline(data: pd.DataFrame, season: str, config: RunConfig,
         lagged, feature_groups, removed_rows, low_data_rescue_used = create_lag_features(
             engineered, rescue_low_data=True,
         )
-        if not low_data_rescue_used:
-            raise
         features, target, years, all_feature_names = prepare_modelling_data(lagged)
-        split = temporal_split(features, target, years, config)
+        if features.empty:
+            raise ValueError(
+                "No usable records remain after preprocessing; at least one row with a "
+                "valid target and predictors is required."
+            ) from split_error
+        try:
+            split = temporal_split(features, target, years, config)
+        except ValueError:
+            update("Very small dataset — fitting with all available records; no holdout split is possible")
+            split_mode = "all available rows; no holdout split"
+            split = {
+                "X_train": features.copy(),
+                "X_validation": features.copy(),
+                "X_test": features.copy(),
+                "y_train": target.copy(),
+                "y_validation": target.copy(),
+                "y_test": target.copy(),
+                "counts": pd.Series({
+                    "train": len(features),
+                    "validation": len(features),
+                    "test": len(features),
+                }),
+            }
 
     update("Selecting the strongest features")
     feature_ranking = select_features(split["X_train"], split["y_train"],
@@ -862,11 +901,21 @@ def run_season_pipeline(data: pd.DataFrame, season: str, config: RunConfig,
 
     deep_predictions = pd.DataFrame()
     deep_best_model_name: str | None = None
+    deep_forecast = pd.DataFrame()
     if deep_result is not None and not deep_result["metrics"].empty:
         deep_predictions = test_metadata.join(
             deep_result["predictions"].drop(columns=["Actual DTWL (mbgl)"], errors="ignore")
         )
         deep_best_model_name = str(deep_result["metrics"].iloc[0]["Model"])
+        deep_best_model = deep_result["models"].get(deep_best_model_name)
+        if deep_best_model is not None:
+            try:
+                deep_forecast = recursive_forecast(
+                    deep_best_model, model_result["scaler"], model_result["X_test"], target,
+                    int(years.max()), config.forecast_steps,
+                )
+            except Exception:
+                deep_forecast = pd.DataFrame()
 
     # Extra artefacts for the notebook-style 2×2 figures.
     x_full = features[selected_features].copy()
@@ -888,11 +937,13 @@ def run_season_pipeline(data: pd.DataFrame, season: str, config: RunConfig,
         "rows_removed": removed_rows,
         "derived_features": derived_features,
         "feature_groups": feature_groups,
+        "clean_data": engineered,
         "lagged_data": lagged,
         "all_feature_names": all_feature_names,
         "feature_ranking": feature_ranking,
         "selected_features": selected_features,
         "split_counts": split["counts"],
+        "split_mode": split_mode,
         "metrics": model_result["metrics"],
         "predictions": predictions,
         "availability": model_result["availability"],
@@ -906,6 +957,7 @@ def run_season_pipeline(data: pd.DataFrame, season: str, config: RunConfig,
         "y_full": y_full,
         "df_lag_full": df_lag_full,
         "fitted_models": model_result["models"],
+        "scaler": model_result["scaler"],
         "feature_cols": selected_features,
         "model_predictions": model_predictions,
         "low_data_rescue_used": low_data_rescue_used,
@@ -915,6 +967,8 @@ def run_season_pipeline(data: pd.DataFrame, season: str, config: RunConfig,
         "deep_model_errors": deep_result["errors"] if deep_result is not None else [],
         "deep_best_model": deep_best_model_name,
         "deep_fitted_models": deep_result["models"] if deep_result is not None else {},
+        "deep_scaler": deep_result["scaler"] if deep_result is not None else model_result["scaler"],
+        "deep_forecast": deep_forecast,
     }
 
 
@@ -1053,16 +1107,36 @@ def stationarity_summary(values: Any) -> dict[str, Any]:
         return {"Status": "Not run", "Reason": f"statsmodels is unavailable: {type(exc).__name__}"}
 
 
+def _excel_safe_text(frame: pd.DataFrame) -> pd.DataFrame:
+    """Prefix formula-like uploaded text so spreadsheet apps treat it as text."""
+    safe = frame.copy()
+    for column in safe.select_dtypes(include=["object", "string"]).columns:
+        safe[column] = safe[column].map(
+            lambda value: (
+                f"'{value}"
+                if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@"))
+                else value
+            )
+        )
+    return safe
+
+
 def build_excel_export(workbook_report: pd.DataFrame, validation_report: pd.DataFrame,
                        season_results: dict[str, dict[str, Any]]) -> bytes:
     """Create one downloadable Excel workbook containing every tabular dashboard result."""
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        workbook_report.to_excel(writer, sheet_name="Upload report", index=False)
-        validation_report.to_excel(writer, sheet_name="Data quality", index=False)
-        season_model_metrics(season_results).to_excel(writer, sheet_name="All-season metrics", index=False)
-        residual_long_table(season_results).to_excel(writer, sheet_name="All residuals", index=False)
-        taylor_statistics(season_results).to_excel(writer, sheet_name="Taylor statistics", index=False)
+        _excel_safe_text(workbook_report).to_excel(writer, sheet_name="Upload report", index=False)
+        _excel_safe_text(validation_report).to_excel(writer, sheet_name="Data quality", index=False)
+        _excel_safe_text(season_model_metrics(season_results)).to_excel(
+            writer, sheet_name="All-season metrics", index=False,
+        )
+        _excel_safe_text(residual_long_table(season_results)).to_excel(
+            writer, sheet_name="All residuals", index=False,
+        )
+        _excel_safe_text(taylor_statistics(season_results)).to_excel(
+            writer, sheet_name="Taylor statistics", index=False,
+        )
         summary_rows = []
         for season, result in season_results.items():
             top = result["metrics"].iloc[0]
@@ -1072,15 +1146,31 @@ def build_excel_export(workbook_report: pd.DataFrame, validation_report: pd.Data
                 "Bias-corrected test RMSE": top["Bias-corrected test RMSE"],
             })
             token = season.replace("-", "")[:12]
-            result["feature_ranking"].to_excel(writer, sheet_name=f"{token} features", index=False)
-            result["metrics"].to_excel(writer, sheet_name=f"{token} metrics", index=False)
-            result["parameters"].to_excel(writer, sheet_name=f"{token} parameters", index=False)
-            result["predictions"].to_excel(writer, sheet_name=f"{token} predictions", index=False)
-            result["full_timeline"].to_excel(writer, sheet_name=f"{token} timeline", index=False)
-            result["forecast"].to_excel(writer, sheet_name=f"{token} forecast", index=False)
+            _excel_safe_text(result["feature_ranking"]).to_excel(
+                writer, sheet_name=f"{token} features", index=False,
+            )
+            _excel_safe_text(result["metrics"]).to_excel(
+                writer, sheet_name=f"{token} metrics", index=False,
+            )
+            _excel_safe_text(result["parameters"]).to_excel(
+                writer, sheet_name=f"{token} parameters", index=False,
+            )
+            _excel_safe_text(result["predictions"]).to_excel(
+                writer, sheet_name=f"{token} predictions", index=False,
+            )
+            _excel_safe_text(result["full_timeline"]).to_excel(
+                writer, sheet_name=f"{token} timeline", index=False,
+            )
+            _excel_safe_text(result["forecast"]).to_excel(
+                writer, sheet_name=f"{token} forecast", index=False,
+            )
             if not result["lofo"].empty:
-                result["lofo"].to_excel(writer, sheet_name=f"{token} sensitivity", index=False)
-        pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Season summary", index=False)
+                _excel_safe_text(result["lofo"]).to_excel(
+                    writer, sheet_name=f"{token} sensitivity", index=False,
+                )
+        _excel_safe_text(pd.DataFrame(summary_rows)).to_excel(
+            writer, sheet_name="Season summary", index=False,
+        )
     return output.getvalue()
 
 
@@ -1271,3 +1361,165 @@ def build_season_forecast_table(model: Any,
         })
     table = pd.DataFrame(rows)
     return table, preds
+
+
+def build_2x2_forecast_figure(results: dict[str, dict[str, Any]], n_steps: int = 5, is_deep: bool = False) -> Any:
+    """Build a 2x2 multi-season, multi-model continuous forecast figure for headline or deep learning models."""
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MultipleLocator
+    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+
+    seasons = [s for s in SEASON_ORDER if s in results]
+    forecast_data: dict[str, dict[str, Any]] = {}
+
+    for season in seasons:
+        res = results[season]
+        scaled_full = res.get("X_full_scaled")
+        df_lag_full = res.get("df_lag_full")
+        fitted_models = res.get("deep_fitted_models" if is_deep else "fitted_models", {})
+        feature_cols = res.get("feature_cols", [])
+        if scaled_full is None or df_lag_full is None or not fitted_models:
+            continue
+
+        last_row = scaled_full.iloc[-1:]
+        last_meta = df_lag_full.iloc[-1]
+
+        forecasts_dict: dict[str, np.ndarray] = {}
+        for name, model in fitted_models.items():
+            try:
+                forecasts_dict[name] = recursive_forecast_constant(
+                    model, last_row, feature_cols, n_steps=n_steps
+                )
+            except Exception:
+                pass
+
+        if not forecasts_dict:
+            continue
+
+        hist_years = df_lag_full["YEAR"].to_numpy()
+        hist_target = df_lag_full[TARGET]
+        df_hist = pd.DataFrame({
+            "Year": hist_years,
+            "DTWL": np.asarray(hist_target).ravel(),
+        })
+        yearly_avg = df_hist.groupby("Year")["DTWL"].mean().reset_index()
+        yearly_frac = yearly_avg["Year"].to_numpy(dtype=float)
+        yearly_dtwl = yearly_avg["DTWL"].to_numpy(dtype=float)
+
+        last_year = int(last_meta["YEAR"])
+        last_season = str(last_meta["Season"])
+        timeline_rows = []
+        for step in range(n_steps):
+            fyear = last_year + step + 1
+            timeline_rows.append({
+                "YEAR": fyear, "Season": last_season, "Step": step + 1,
+                "Frac": fractional_year(fyear, last_season),
+            })
+        df_timeline = pd.DataFrame(timeline_rows)
+
+        forecast_data[season] = {
+            "yearly_frac": yearly_frac,
+            "yearly_dtwl": yearly_dtwl,
+            "forecast_frac": df_timeline["Frac"].to_numpy(),
+            "forecast_timeline": df_timeline,
+            "forecasts_dict": forecasts_dict,
+            "n_steps": n_steps,
+        }
+
+    if not forecast_data:
+        return None
+
+    fig, axes = plt.subplots(2, 2, figsize=(24, 15))
+    axes = axes.flatten()
+    all_handles, all_labels = [], []
+
+    for idx, season in enumerate(SEASON_ORDER):
+        ax = axes[idx]
+        if season not in forecast_data:
+            ax.text(0.5, 0.5, f"No forecast for {season}",
+                    transform=ax.transAxes, ha="center", va="center",
+                    fontsize=14)
+            ax.set_title(season, fontsize=14, fontweight="bold")
+            continue
+
+        data = forecast_data[season]
+        yearly_frac = data["yearly_frac"]
+        yearly_dtwl = data["yearly_dtwl"]
+        forecast_frac = data["forecast_frac"]
+        df_timeline = data["forecast_timeline"]
+        forecasts_dict = data["forecasts_dict"]
+
+        ax.plot(yearly_frac, yearly_dtwl, "k-", lw=2.5, alpha=0.85,
+                label="Historical (annual mean)")
+        last_obs_x, last_obs_y = yearly_frac[-1], yearly_dtwl[-1]
+        ax.plot(last_obs_x, last_obs_y, "ko", markersize=10,
+                label="Last observed year")
+
+        colours = plt.cm.tab10(np.linspace(0, 1, max(len(forecasts_dict), 1)))
+        for colour, (name, preds) in zip(colours, forecasts_dict.items()):
+            cont_x = np.concatenate([[last_obs_x], forecast_frac])
+            cont_y = np.concatenate([[last_obs_y], preds])
+            ax.plot(cont_x, cont_y, "--o", color=colour, lw=2.5,
+                    markersize=9, label=name)
+
+        sample_name = next(iter(forecasts_dict))
+        for i, row in df_timeline.reset_index(drop=True).iterrows():
+            frac = row["Frac"]
+            y_val = float(forecasts_dict[sample_name][i])
+            label = f"{int(row['YEAR'])}\n{row['Season']}"
+            ax.annotate(label, xy=(frac, y_val),
+                        xytext=(frac, y_val + 1.5),
+                        arrowprops=dict(arrowstyle="->",
+                                        color="darkblue", lw=1.4),
+                        fontsize=9, fontweight="bold",
+                        color="darkblue", ha="center", va="bottom")
+
+        ax.set_xlim(yearly_frac[0] - 0.2, forecast_frac[-1] + 0.5)
+        all_y = np.concatenate([yearly_dtwl] +
+                               [np.asarray(p) for p in forecasts_dict.values()])
+        ax.set_ylim(all_y.min() - 1.0, all_y.max() + 1.0)
+        ax.set_xlabel("Year", fontsize=12)
+        ax.set_ylabel("DTWL (mbgl)", fontsize=12)
+        ax.set_title(season, fontsize=14, fontweight="bold")
+        ax.grid(alpha=0.3)
+        ax.xaxis.set_major_locator(MultipleLocator(3))
+        ax.tick_params(labelsize=11)
+
+        hist_slice = slice(-10, None) if len(yearly_frac) > 10 else slice(0, None)
+        zoom_x_hist = yearly_frac[hist_slice]
+        zoom_y_hist = yearly_dtwl[hist_slice]
+        all_y_zoom = np.concatenate([zoom_y_hist] +
+                                    [np.asarray(p) for p in forecasts_dict.values()])
+        axins = inset_axes(ax, width="100%", height="100%",
+                           bbox_to_anchor=(0.02, 0.58, 0.40, 0.35),
+                           bbox_transform=ax.transAxes, borderpad=0)
+        axins.plot(zoom_x_hist, zoom_y_hist, "k-", lw=2)
+        for colour, (name, preds) in zip(colours, forecasts_dict.items()):
+            axins.plot(forecast_frac, preds, "--o", color=colour,
+                       lw=2, markersize=6)
+        axins.set_xlim(zoom_x_hist[0] - 0.2, forecast_frac[-1] + 0.3)
+        axins.set_ylim(all_y_zoom.min() - 0.5, all_y_zoom.max() + 0.5)
+        axins.grid(alpha=0.3)
+        axins.tick_params(labelsize=8)
+        for spine in axins.spines.values():
+            spine.set_linewidth(1.4)
+            spine.set_color("black")
+
+        h, l = ax.get_legend_handles_labels()
+        for hi, li in zip(h, l):
+            if li not in all_labels:
+                all_handles.append(hi)
+                all_labels.append(li)
+
+    for j in range(len(SEASON_ORDER), len(axes)):
+        axes[j].set_visible(False)
+
+    title_prefix = "Deep-learning & physics-informed" if is_deep else "Machine learning"
+    fig.legend(all_handles, all_labels,
+               loc="center left", bbox_to_anchor=(0.89, 0.5),
+               frameon=True, edgecolor="black", fancybox=False,
+               fontsize=11, title="Model / Event", title_fontsize=12)
+    fig.suptitle(f"{title_prefix} groundwater forecasts — continuous extension from last observed year",
+                 fontsize=18, fontweight="bold")
+    plt.tight_layout(rect=[0, 0, 0.90, 0.96])
+    return fig

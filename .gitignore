@@ -1,17 +1,11 @@
-# Compiled
-*.elc
-
-# Packaging
-.cask/
-.eask/
-.eldev/
-.keg/
-
-# Built distribution
-dist/
-
-# Backup files
-*~
-
-# Undo-tree save-files
-*.~undo-tree
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.streamlit/secrets.toml
+*.pem
+*.key
